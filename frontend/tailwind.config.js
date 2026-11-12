@@ -9,12 +9,14 @@ module.exports = {
   ],
   theme: {
     extend: {
+      fontFamily: { sans: ['"Plus Jakarta Sans"', 'sans-serif'] },
       borderRadius: {
         lg: 'var(--radius)',
         md: 'calc(var(--radius) - 2px)',
         sm: 'calc(var(--radius) - 4px)'
       },
       colors: {
+        brand: { DEFAULT: '#7C3AED', deep: '#6D28D9', ink: '#4C1D95', soft: '#EDE9FE', mist: '#F5F3FF' },
         background: 'hsl(var(--background))',
         foreground: 'hsl(var(--foreground))',
         card: {
