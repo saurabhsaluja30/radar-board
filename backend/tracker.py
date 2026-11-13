@@ -247,9 +247,13 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
         ctype = (file.content_type or "").lower()
         if ctype not in EVIDENCE_TYPES:
             raise HTTPException(status_code=400, detail="Please upload a PDF, PNG, JPG or WEBP file")
-        data = await file.read()
+        data = await file.read(5 * 1024 * 1024 + 1)
         if len(data) > 5 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="File must be under 5 MB")
+        magic = {"pdf": data[:5] == b"%PDF-", "png": data[:8] == b"\x89PNG\r\n\x1a\n", "jpg": data[:3] == b"\xff\xd8\xff",
+                 "webp": data[:4] == b"RIFF" and data[8:12] == b"WEBP"}
+        if not magic[EVIDENCE_TYPES[ctype]]:
+            raise HTTPException(status_code=400, detail="The file content does not match its type")
         path = f"{APP_NAME}/evidence/{user['user_id']}/{uuid.uuid4().hex}.{EVIDENCE_TYPES[ctype]}"
         try:
             res = await asyncio.to_thread(_put_object, path, data, ctype)

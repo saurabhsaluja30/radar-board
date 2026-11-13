@@ -1,0 +1,39 @@
+{
+  "summary": "Tested backend and UI for the Success Tracker, Candidate Demand Analytics, Registration counter visibility and the tracker-reminder cron. New pytest suite /app/backend/tests/test_tracker_demand.py: 28/28 passed. Existing test_jobradar_api.py: 18/18 passed. UI (Playwright, desktop): track button and its tracked state, /tracker modals (interview and hired validation), status-history chips with timestamps, evidence dialog (redaction gate plus a real PNG upload), 3-day reminder showing and dismissing (stays dismissed after reload), admin Dashboard reg-* stats (match API and DB), /admin/demand (bars, Paid filter, reset, industry click opening the candidate modal, both CSV exports), /admin/success (totals, conversions, Verify/Unverify updating the verification totals, evidence viewer, CSV export, company/job id/date filters). Regression: explore, admin job management, and guest track redirecting to login all work. No candidate-facing numeric registration or spot counts. Found and fixed one UI bug: modals inside the admin shell rendered off-screen.",
+  "backend_issues": {"critical": [], "minor": [
+    {"endpoint": "POST /api/tracker/{id}/evidence", "issue": "The file type check trusts the client-supplied content_type and does not check the file's actual bytes (magic bytes). The whole file is read into memory before the 5MB check."},
+    {"endpoint": "GET /api/admin/analytics/*", "issue": "enriched() calls compute_membership for every candidate one at a time (N+1 queries) on every request, and loads up to 50k users. This will be slow at scale."},
+    {"endpoint": "GET /api/admin/success", "issue": "Conversions are counted on the stages a job has 'reached'. A candidate who jumps from Interested straight to Hired is counted as hired but not as applied, so 'Applied → Hired' can show 0/1 while there is 1 hire. Consider marking earlier funnel stages as reached when a later one is chosen, or explain this in the UI."},
+    {"endpoint": "GET /api/admin/success", "issue": "Date filters apply to the date tracking started (created_at), not to when the stage was reached."}
+  ]},
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "Modal inside AdminShell (evidence viewer, also any admin modal)", "issue": "The .fade-up animation used 'animation-fill-mode: both', which left a transform animation in effect on the admin content wrapper. That wrapper became the containing block for position:fixed modals, so the modal was placed relative to the scrolled content: the evidence modal's close button sat at y=-128px (off-screen), and the overlay did not cover the sidebar. FIXED by changing it to 'backwards' in index.css. Close button is now at y=146 and works.", "selector": "[data-testid=evidence-close]", "priority": "HIGH (fixed)"}
+    ],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "/admin/demand, /admin/success date range", "issues": ["Uses the browser's native date input (mm/dd/yyyy) instead of the shadcn Calendar date picker. Tracker interview and joining date inputs are native too."]},
+      {"screen": "/tracker header", "issues": ["The 'Email reminders' toggle sticks out ~15px past the right edge of the content container."]},
+      {"screen": "/admin/success evidence viewer", "issues": ["The PDF iframe shows blank in headless Chromium (expected there). Check manually in a real browser."]}
+    ]
+  },
+  "test_report_links": ["/app/backend/tests/test_tracker_demand.py", "/app/backend/tests/test_jobradar_api.py", "/app/test_reports/pytest/tracker_demand.xml"],
+  "action_items": [
+    "Optional: render Modal through a React portal (createPortal to document.body) so a transformed ancestor can never break it again (CSS already fixed)",
+    "Consider marking earlier funnel stages as reached on a forward jump, or explain this in the conversions UI",
+    "Check evidence file bytes against the declared type; avoid the N+1 compute_membership calls in demand analytics",
+    "Use the shadcn Calendar picker instead of native date inputs (design consistency)"
+  ],
+  "critical_code_review_comments": [
+    "tracker.py reminder key = days:updated_at, so dismissing at 3 days still lets the 7/14/30-day reminders fire later. That matches the spec.",
+    "The cron is idempotent per run_id/X-Webhook-Id and acks with 200 before sending. Without a header or run_id, a random run_id is generated, so manual repeated calls will re-run (only emails not yet sent go out).",
+    "The admin evidence endpoint's Content-Disposition filename has no file extension."
+  ],
+  "updated_files": ["/app/frontend/src/index.css", "/app/backend/tests/test_tracker_demand.py"],
+  "success_rate": {"backend": "100% (46/46)", "frontend": "100% after the modal positioning fix"},
+  "test_credentials": "Used /app/memory/test_credentials.md (admin and test@jobradar.com). Both work.",
+  "seed_data_creation": "The backend tests register TEST_ candidates (test_trk_*@example.com, test_*@example.com). Their trackers are archived, but the users stay because there is no delete endpoint. These TEST_ users inflate the registration and demand counts. Deleted the UI-created tracker trk_935b176dc87f and its evidence ev_eee629af272c by id. The seeded tracker trk_8dfcc2ef5ffc had updated_at moved back temporarily and was restored afterwards.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Run test_tracker_demand.py with -n 0 (its module fixtures share state). Candidate test@jobradar.com allows one session at a time, so a new login logs out the previous one. To test reminders, set job_tracker.updated_at back by 4+ days for a non-terminal tracker. Evidence storage (Emergent object storage) upload and download work."
+}

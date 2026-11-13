@@ -60,7 +60,7 @@ body {
   .nav-link-active { @apply bg-brand-mist text-brand; }
 }
 
-.fade-up { animation: fadeUp 0.5s ease both; }
+.fade-up { animation: fadeUp 0.5s ease backwards; }
 @keyframes fadeUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
 .radar-grid {
   background-image: radial-gradient(circle at 80% 20%, rgba(167, 139, 250, 0.35), transparent 40%),

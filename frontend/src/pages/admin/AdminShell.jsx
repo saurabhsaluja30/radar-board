@@ -70,7 +70,7 @@ export function AdminShell() {
     <div className="flex min-h-screen">
       <aside className="sticky top-0 flex h-screen w-72 shrink-0 flex-col bg-brand-ink p-5">
         <BrandLogo dark />
-        <nav className="mt-8 flex-1 space-y-4 overflow-y-auto">
+        <nav className="mt-8 min-h-0 flex-1 space-y-4 overflow-y-auto pb-4">
           {GROUPS.map(([group, items]) => (
             <div key={group} className="space-y-1">
               <p className="px-3.5 text-[10px] font-bold uppercase tracking-widest text-violet-300">{group}</p>

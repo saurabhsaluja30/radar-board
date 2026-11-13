@@ -221,7 +221,7 @@ export default function Tracker() {
       <PageHeader title="My Job Search Tracker"
         subtitle="Keep track of jobs you found on JobRadar and update your progress as you contact recruiters and apply directly. Tracking a job is not an application."
         right={
-          <label className="flex items-center gap-3 text-sm font-semibold text-gray-600">
+          <label className="flex shrink-0 items-center gap-3 pr-1 text-sm font-semibold text-gray-600">
             Email reminders
             <Switch checked={data?.email_reminders !== false} onChange={toggleEmail} data-testid="tracker-email-toggle" />
           </label>

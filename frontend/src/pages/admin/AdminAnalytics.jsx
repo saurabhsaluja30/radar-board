@@ -289,7 +289,7 @@ export function AdminSuccess() {
               <Stat key={k} label={l} value={data.totals[k].records} hint={`${data.totals[k].candidates} unique candidate${data.totals[k].candidates === 1 ? "" : "s"}`} testId={`success-total-${k}`} />
             ))}
           </div>
-          <p className="text-xs text-gray-400">Big number = unique candidate–job records that ever reached the stage (repeat updates are counted once). Hint = unique candidates.</p>
+          <p className="text-xs text-gray-400">Big number = unique candidate–job records that ever reached the stage (repeat updates are counted once). Hint = unique candidates. A stage counts only when the candidate explicitly selected it — e.g. an application is counted only when they confirm “Applied”. Date filters use the date tracking started.</p>
           <div className="grid gap-6 lg:grid-cols-[1.2fr_1fr]">
             <Card data-testid="success-conversions">
               <p className="h-sec mb-4">Conversion Rates</p>
