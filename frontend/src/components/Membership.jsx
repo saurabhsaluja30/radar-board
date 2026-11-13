@@ -7,7 +7,7 @@ import { useAuth } from "@/context/AuthContext";
 import { MEMBERSHIP_UI, OPPORTUNITY_NOTICE, OPPORTUNITY_NOTICE_FREE, formatDate } from "@/lib/constants";
 import { Button, Card } from "@/components/kit";
 
-const PLACEHOLDER = { enabled: true, plans_hidden: true, free_days: 90, spots_total: 100, spots_left: -1 };
+const PLACEHOLDER = { enabled: true, plans_hidden: true, free_days: 90, spots_available: true };
 
 export function useLaunchOffer() {
   const q = useQuery({ queryKey: ["launch-offer"], queryFn: () => api("/launch-offer", { auth: false }) });
@@ -73,8 +73,8 @@ export function LaunchOfferCard() {
   const { data, isPlaceholderData } = useLaunchOffer();
   if (!data || isPlaceholderData) return null;
   const status = user?.launch_offer;
-  let title = `Free for our first ${data.spots_total} members`;
-  let body = `Register now and get free full access for ${data.free_days} days — curated jobs, direct apply links and Career Tools. ${data.spots_left} of ${data.spots_total} free spots left.`;
+  let title = "Free access for our early members";
+  let body = `Register now and get free full access for ${data.free_days} days — curated jobs, direct apply links and Career Tools, while launch spots last.`;
   let cta = { label: "Claim Free Access", to: "/auth/register" };
   let Icon = Gift;
   if (user && membership?.is_active) {
@@ -96,7 +96,7 @@ export function LaunchOfferCard() {
     body = "Membership plans are not open yet. Create a free account to browse job previews and we'll notify you when plans are available.";
     cta = { label: "Create Free Account", to: "/auth/register" };
     Icon = Hourglass;
-  } else if (data.spots_left <= 0) {
+  } else if (!data.spots_available) {
     title = "Free spots are full — join the waitlist";
     body = "All free launch spots have been claimed. Register to join the waitlist and we'll email you when your access is approved.";
     cta = { label: "Join the Waitlist", to: "/auth/register" };

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 import uuid
@@ -900,7 +901,7 @@ class LaunchReq(BaseModel):
 async def launch_offer_public():
     s = await get_launch()
     return {"enabled": s["enabled"], "plans_hidden": s["plans_hidden"], "free_days": s["free_days"],
-            "spots_total": s["free_spots"], "spots_left": max(0, s["free_spots"] - s.get("granted", 0))}
+            "spots_available": s["free_spots"] - s.get("granted", 0) > 0}
 
 
 @api.get("/admin/launch-offer")
@@ -1591,9 +1592,14 @@ async def startup():
         await db.users.create_index("user_id", unique=True)
         await db.user_sessions.create_index("session_token", unique=True)
         await db.jobs.create_index("job_id", unique=True)
+        await db.job_tracker.create_index([("candidate_id", 1), ("job_id", 1)], unique=True)
+        await db.job_tracker.create_index("tracker_id", unique=True)
+        await db.tracker_evidence.create_index("tracker_id")
+        await db.cron_runs.create_index("run_id", unique=True)
     except Exception as e:
         logger.warning(f"Index creation: {e}")
     await seed()
+    await asyncio.to_thread(_warm_storage, logger)
     logger.info("JobRadar backend ready")
 
 
@@ -1611,6 +1617,12 @@ from career import build_router as _build_career_router  # noqa: E402
 
 api.include_router(_build_career_router(db, get_current_user, require_admin, compute_membership,
                                         now_utc, now_iso, parse_dt))
+from tracker import build_router as _build_tracker_router, warm_storage as _warm_storage  # noqa: E402
+from demand import build_router as _build_demand_router  # noqa: E402
+
+api.include_router(_build_tracker_router(db, get_current_user, require_admin, compute_membership, send_and_log_email,
+                                         _wrap_email, now_utc, now_iso, parse_dt))
+api.include_router(_build_demand_router(db, require_admin, compute_membership, now_utc))
 app.include_router(api)
 app.add_middleware(
     CORSMiddleware,

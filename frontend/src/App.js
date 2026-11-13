@@ -9,6 +9,7 @@ import Home from "@/pages/Home";
 import Explore from "@/pages/Explore";
 import JobDetail from "@/pages/JobDetail";
 import Saved from "@/pages/Saved";
+import Tracker from "@/pages/Tracker";
 import { Forgot, Login, Register } from "@/pages/Auth";
 import { Account, Dashboard, Membership, Plans, Profile } from "@/pages/Member";
 import { About, Contact, FAQ, Legal } from "@/pages/Info";
@@ -18,6 +19,7 @@ import Analyser from "@/pages/career/Analyser";
 import { CareerHistory, InterviewSession, InterviewSetup } from "@/pages/career/Interview";
 import { AdminDashboard, AdminShell } from "@/pages/admin/AdminShell";
 import { AdminCandidates, AdminJobEdit, AdminJobs, AdminPayments, AdminSubscriptions } from "@/pages/admin/AdminManage";
+import { AdminDemand, AdminRegistration, AdminSuccess } from "@/pages/admin/AdminAnalytics";
 import { AdminCareer, AdminDevPanel, AdminEmails, AdminLaunch } from "@/pages/admin/AdminTools";
 import { useAuth } from "@/context/AuthContext";
 
@@ -51,6 +53,7 @@ export default function App() {
               <Route path="/explore" element={<Explore />} />
               <Route path="/job/:id" element={<JobDetail />} />
               <Route path="/saved" element={<Saved />} />
+              <Route path="/tracker" element={authed(<Tracker />)} />
               <Route path="/account" element={<Account />} />
               <Route path="/auth/login" element={<Login />} />
               <Route path="/auth/register" element={<Register />} />
@@ -82,6 +85,9 @@ export default function App() {
               <Route path="dev-panel" element={<AdminDevPanel />} />
               <Route path="launch" element={<AdminLaunch />} />
               <Route path="career" element={<AdminCareer />} />
+              <Route path="registration" element={<AdminRegistration />} />
+              <Route path="demand" element={<AdminDemand />} />
+              <Route path="success" element={<AdminSuccess />} />
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>

@@ -8,6 +8,7 @@ import { formatDate } from "@/lib/constants";
 import { Button, Card, notify, Spinner } from "@/components/kit";
 import { useLaunchOffer } from "@/components/Membership";
 import { Page } from "@/components/Layout";
+import { TrackButton } from "@/pages/Tracker";
 
 const KV = ({ label, value }) => (
   <div className="flex justify-between gap-4 border-b border-gray-100 py-2.5 text-sm last:border-0">
@@ -145,6 +146,8 @@ export default function JobDetail() {
             ) : (
               <Button full size="lg" title={cta.short} onClick={cta.go} data-testid="job-plans-btn" />
             )}
+            <div className="mt-3"><TrackButton jobId={id} /></div>
+            <p className="mt-2 text-center text-[11px] text-gray-400">Tracking helps you follow up. It is not an application.</p>
             <div className="mt-3 grid grid-cols-2 gap-2">
               <Button variant="outline" size="sm" title={job.is_saved ? "Saved" : "Save"} onClick={toggleSave}
                 icon={<Bookmark className={`h-4 w-4 ${job.is_saved ? "fill-brand" : ""}`} />} data-testid="job-save-btn" />

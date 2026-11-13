@@ -1,24 +1,30 @@
 import React, { useState } from "react";
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { Briefcase, CreditCard, FlaskConical, Gift, LayoutDashboard, LogOut, Mail, Receipt, ShieldCheck, Sparkles, Users } from "lucide-react";
+import { BarChart3, Briefcase, CreditCard, FlaskConical, Gift, LayoutDashboard, LogOut, Mail, PieChart, Receipt, ShieldCheck, Sparkles, Trophy, UserPlus, Users } from "lucide-react";
+import { RegistrationStats } from "@/pages/admin/AdminAnalytics";
 import { api } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { money } from "@/lib/constants";
 import { Button, Card, Input, notify, PageHeader } from "@/components/kit";
 import { BrandLogo } from "@/components/Layout";
 
-const NAV = [
-  { icon: LayoutDashboard, label: "Dashboard", to: "/admin", end: true },
-  { icon: FlaskConical, label: "Developer Test Panel", to: "/admin/dev-panel" },
-  { icon: Briefcase, label: "Job Management", to: "/admin/jobs" },
-  { icon: Users, label: "Candidates", to: "/admin/candidates" },
-  { icon: CreditCard, label: "Subscriptions", to: "/admin/subscriptions" },
-  { icon: Receipt, label: "Payments", to: "/admin/payments" },
-  { icon: Mail, label: "Email Logs", to: "/admin/emails" },
-  { icon: Sparkles, label: "Career Tools", to: "/admin/career" },
-  { icon: Gift, label: "Launch Offer & Waitlist", to: "/admin/launch" },
+const GROUPS = [
+  ["Dashboard Overview", [{ icon: LayoutDashboard, label: "Dashboard", to: "/admin", end: true }]],
+  ["Candidate Management", [{ icon: Users, label: "Candidates", to: "/admin/candidates" }, { icon: Gift, label: "Launch Offer & Waitlist", to: "/admin/launch" }]],
+  ["Job Management", [{ icon: Briefcase, label: "Job Management", to: "/admin/jobs" }]],
+  ["Subscription and Payment Management", [{ icon: CreditCard, label: "Subscriptions", to: "/admin/subscriptions" }, { icon: Receipt, label: "Payments", to: "/admin/payments" }]],
+  ["Analytics", [
+    { icon: UserPlus, label: "Candidate Registration Analytics", to: "/admin/registration" },
+    { icon: PieChart, label: "Candidate Demand Analytics", to: "/admin/demand" },
+    { icon: Trophy, label: "JobRadar Success Analytics", to: "/admin/success" },
+  ]],
+  ["Tools", [
+    { icon: Mail, label: "Email Logs", to: "/admin/emails" }, { icon: Sparkles, label: "Career Tools", to: "/admin/career" },
+    { icon: FlaskConical, label: "Developer Test Panel", to: "/admin/dev-panel" },
+  ]],
 ];
+const NAV = GROUPS.flatMap(([, items]) => items);
 
 function AdminLogin() {
   const navigate = useNavigate();
@@ -64,12 +70,17 @@ export function AdminShell() {
     <div className="flex min-h-screen">
       <aside className="sticky top-0 flex h-screen w-72 shrink-0 flex-col bg-brand-ink p-5">
         <BrandLogo dark />
-        <nav className="mt-10 flex-1 space-y-1">
-          {NAV.map((n) => (
+        <nav className="mt-8 flex-1 space-y-4 overflow-y-auto">
+          {GROUPS.map(([group, items]) => (
+            <div key={group} className="space-y-1">
+              <p className="px-3.5 text-[10px] font-bold uppercase tracking-widest text-violet-300">{group}</p>
+              {items.map((n) => (
             <NavLink key={n.to} to={n.to} end={n.end} data-testid={`admin-nav-${n.label}`}
               className={({ isActive }) => `flex items-center gap-3 rounded-xl px-3.5 py-2.5 text-sm font-semibold transition-colors ${isActive ? "bg-white text-brand-ink" : "text-violet-100 hover:bg-white/10"}`}>
-              <n.icon className="h-4 w-4" /> {n.label}
+              <n.icon className="h-4 w-4 shrink-0" /> {n.label}
             </NavLink>
+              ))}
+            </div>
           ))}
         </nav>
         <button onClick={() => navigate("/")} className="mb-2 text-left text-sm font-semibold text-violet-200 hover:text-white" data-testid="admin-view-site">← View site</button>
@@ -89,10 +100,6 @@ export function AdminDashboard() {
   const navigate = useNavigate();
   const { data } = useQuery({ queryKey: ["admin-dashboard"], queryFn: () => api("/admin/dashboard") });
   const metrics = [
-    { label: "Candidates", value: data?.total_candidates ?? "—" },
-    { label: "Active Members", value: data?.active_members ?? "—" },
-    { label: "Expired", value: data?.expired_members ?? "—" },
-    { label: "New (7d)", value: data?.new_registrations_week ?? "—" },
     { label: "Real Revenue", value: money(data?.real_revenue) },
     { label: "Demo Revenue", value: money(data?.demo_revenue) },
     { label: "Jobs Published", value: data?.jobs_published ?? "—" },
@@ -100,7 +107,10 @@ export function AdminDashboard() {
   ];
   return (
     <>
-      <PageHeader title="Dashboard" />
+      <PageHeader title="Dashboard Overview" />
+      <h2 className="h-sec mb-4">Candidate Registrations</h2>
+      <RegistrationStats />
+      <h2 className="h-sec mb-4 mt-10">Business</h2>
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         {metrics.map((m) => (
           <Card key={m.label} data-testid={`metric-${m.label}`}>

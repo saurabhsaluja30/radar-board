@@ -46,6 +46,7 @@ export function Account() {
   }
   const links = [
     { icon: LayoutGrid, label: "Dashboard", to: "/dashboard" },
+    { icon: Sparkles, label: "My Job Search Tracker", to: "/tracker" },
     { icon: Briefcase, label: "Career Tools", to: "/career" },
     { icon: CreditCard, label: launch?.plans_hidden ? "My Access" : "Membership & Plans", to: "/membership" },
     { icon: UserCog, label: "Edit Profile", to: "/profile" },
@@ -296,6 +297,7 @@ export function Dashboard() {
       <PageHeader title={`Welcome, ${(user.full_name || "there").split(" ")[0]}`} subtitle="Here is your JobRadar snapshot." />
       <div className="grid gap-8 lg:grid-cols-[1fr_380px]">
         <div className="min-w-0 space-y-12">
+          <TrackerSummary />
           <div data-testid="dashboard-career-tools">
             <SectionTitle title="Career Tools" action="Open" onAction={() => navigate("/career")} />
             <CareerToolsCards />
@@ -326,6 +328,25 @@ export function Dashboard() {
         </aside>
       </div>
     </Page>
+  );
+}
+
+function TrackerSummary() {
+  const navigate = useNavigate();
+  const { user } = useAuth();
+  const { data } = useQuery({ queryKey: ["tracker", user?.user_id], queryFn: () => api("/tracker"), enabled: !!user });
+  const items = data?.items || [];
+  const reminders = items.filter((i) => i.reminder).length;
+  return (
+    <Card className="flex flex-wrap items-center gap-4" data-testid="dashboard-tracker">
+      <div className="flex-1">
+        <p className="h-sec">My Job Search Tracker</p>
+        <p className="muted mt-1">
+          {items.length ? `${items.length} tracked job${items.length === 1 ? "" : "s"}${reminders ? ` · ${reminders} need${reminders === 1 ? "s" : ""} an update` : ""}` : "Track jobs you're interested in and record your progress."}
+        </p>
+      </div>
+      <Button size="sm" title="Open Tracker" onClick={() => navigate("/tracker")} data-testid="dashboard-tracker-open" />
+    </Card>
   );
 }
 

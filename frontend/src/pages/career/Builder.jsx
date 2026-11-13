@@ -89,6 +89,7 @@ export function ResumeBuilder() {
     const res = await api("/career/resumes", {
       method: "POST",
       body: {
+        title: key,
         resume_type: rtype,
         personal: ownPersonal,
         sections: sections.map((s) => ({ title: s.title, content: "", hint: s.hint + (s.optional ? "\n(Optional — remove if not needed)" : "") })),
