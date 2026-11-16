@@ -321,7 +321,8 @@ async def compute_membership(candidate_id: str) -> dict:
 # ---------------------------------------------------------------------------
 # Job serialization
 # ---------------------------------------------------------------------------
-PREVIEW_FIELDS = ["job_id", "title", "company", "function", "sub_function", "industry",
+PREVIEW_FIELDS = ["job_id", "title", "company", "function", "sub_function", "industry", "experience_min", "experience_max",
+                  "date_published", "expiry_date", "job_source",
                   "industry_category", "designation", "region", "location", "city", "country",
                   "currency", "visa_info", "experience_required", "work_mode", "employment_type",
                   "date_added", "last_updated", "featured", "status", "application_deadline",
@@ -341,6 +342,32 @@ def serialize_job(job: dict, is_member: bool, is_saved: bool = False) -> dict:
         for k in PREMIUM_FIELDS:
             out[k] = job.get(k)
     return out
+
+
+async def audit_log(admin: dict, action: str, entity: str, entity_id: str, details: Optional[dict] = None):
+    await db.admin_audit_log.insert_one({"audit_id": f"au_{uuid.uuid4().hex[:12]}", "admin_id": admin["user_id"],
+                                         "admin_email": admin.get("email"), "action": action, "entity": entity,
+                                         "entity_id": entity_id, "details": details or {}, "at": now_iso()})
+
+
+def _validate_job(job: dict):
+    if job.get("verification_status") not in ("Pending Verification", "Verified", "Rejected"):
+        raise HTTPException(status_code=400, detail="Invalid verification status")
+    if job.get("status") not in ("Draft", "Published", "Unpublished", "Expired", "Closed"):
+        raise HTTPException(status_code=400, detail="Invalid job status")
+    lo, hi = job.get("experience_min"), job.get("experience_max")
+    if lo is not None and hi is not None and lo > hi:
+        raise HTTPException(status_code=400, detail="Minimum experience cannot exceed maximum")
+    lo, hi = job.get("salary_min"), job.get("salary_max")
+    if lo is not None and hi is not None and lo > hi:
+        raise HTTPException(status_code=400, detail="Minimum salary cannot exceed maximum")
+    for k in ("expiry_date", "date_received"):
+        if job.get(k):
+            try:
+                datetime.fromisoformat(job[k][:10])
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"{k.replace('_', ' ')} must be YYYY-MM-DD")
+            job[k] = job[k][:10]
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +427,21 @@ class ProfileReq(BaseModel):
     preferred_industries: Optional[List[str]] = None
     preferred_designation: Optional[str] = None
     preferred_work_mode: Optional[str] = None
+    total_experience: Optional[float] = None
+    current_company: Optional[str] = None
+    expected_ctc: Optional[float] = None
+    expected_ctc_currency: Optional[str] = None
+    primary_skills: Optional[List[str]] = None
+    secondary_skills: Optional[List[str]] = None
+    preferred_titles: Optional[List[str]] = None
+    preferred_locations: Optional[List[str]] = None
+    preferred_country: Optional[str] = None
+    notice_period: Optional[str] = None
+    willing_to_relocate: Optional[bool] = None
+    employment_type_pref: Optional[str] = None
+    profile_status: Optional[str] = None
+    job_alert_consent: Optional[bool] = None
+    job_alert_frequency: Optional[str] = None
 
 
 class CheckoutReq(BaseModel):
@@ -438,6 +480,17 @@ class JobReq(BaseModel):
     verification_score: Optional[int] = 80
     admin_notes: Optional[str] = ""
     company_logo: Optional[str] = ""
+    verification_status: Optional[str] = "Pending Verification"
+    experience_min: Optional[float] = None
+    experience_max: Optional[float] = None
+    salary_min: Optional[float] = None
+    salary_max: Optional[float] = None
+    qualifications: Optional[str] = ""
+    mandatory_requirements: Optional[str] = ""
+    notice_period_pref: Optional[str] = ""
+    job_source: Optional[str] = ""
+    date_received: Optional[str] = ""
+    expiry_date: Optional[str] = ""
 
 
 class PlanReq(BaseModel):
@@ -635,6 +688,21 @@ async def change_password(req: ChangePwReq, user=Depends(get_current_user)):
 @api.put("/auth/profile")
 async def update_profile(req: ProfileReq, user=Depends(get_current_user)):
     updates = {k: v for k, v in req.dict().items() if v is not None}
+    if updates.get("total_experience") is not None and not 0 <= updates["total_experience"] <= 60:
+        raise HTTPException(status_code=400, detail="Total experience must be between 0 and 60 years")
+    if updates.get("expected_ctc") is not None and updates["expected_ctc"] < 0:
+        raise HTTPException(status_code=400, detail="Expected CTC cannot be negative")
+    for k, allowed in (("profile_status", ("Active", "Inactive")), ("job_alert_frequency", ("Instant", "Daily", "Weekly")),
+                       ("employment_type_pref", ("Full-time", "Part-time", "Contract", "Internship", "Any"))):
+        if k in updates and updates[k] not in allowed:
+            raise HTTPException(status_code=400, detail=f"Invalid {k.replace('_', ' ')}")
+    for k in ("primary_skills", "secondary_skills", "preferred_titles", "preferred_locations"):
+        if k in updates:
+            updates[k] = list(dict.fromkeys(x.strip()[:80] for x in updates[k] if x and x.strip()))[:30]
+    if "job_alert_consent" in updates and bool(user.get("job_alert_consent")) != updates["job_alert_consent"]:
+        await db.consent_records.insert_one({"consent_id": f"cs_{uuid.uuid4().hex[:12]}", "user_id": user["user_id"],
+                                             "type": "job_alerts", "granted": updates["job_alert_consent"],
+                                             "source": "profile", "at": now_iso()})
     updates["updated_at"] = now_iso()
     await db.users.update_one({"user_id": user["user_id"]}, {"$set": updates})
     updated = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0, "password": 0})
@@ -687,7 +755,8 @@ async def list_jobs(
     sort: str = "newest",
     limit: int = 50,
 ):
-    query: dict = {"status": "Published"}
+    await _sm_helpers["sweep_expired"]()
+    query: dict = {"status": "Published", "verification_status": "Verified"}
     if function and function != "All":
         query["function"] = function
     if location:
@@ -726,7 +795,7 @@ async def list_jobs(
 
 @api.get("/jobs/{job_id}")
 async def get_job(job_id: str, user=Depends(get_optional_user)):
-    job = await db.jobs.find_one({"job_id": job_id, "status": "Published"},
+    job = await db.jobs.find_one({"job_id": job_id, "status": "Published", "verification_status": "Verified"},
                                  {"_id": 0, "admin_notes": 0, "verification_score": 0})
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -986,12 +1055,12 @@ async def dashboard(user=Depends(get_current_user)):
     saved_jobs_docs = await db.jobs.find({"job_id": {"$in": saved_ids}},
                                          {"_id": 0, "admin_notes": 0, "verification_score": 0}).to_list(20)
     smap = {j["job_id"]: j for j in saved_jobs_docs}
-    recent = await db.jobs.find({"status": "Published"}, {"_id": 0, "admin_notes": 0, "verification_score": 0}).sort(
+    recent = await db.jobs.find({"status": "Published", "verification_status": "Verified"}, {"_id": 0, "admin_notes": 0, "verification_score": 0}).sort(
         "date_added", -1).limit(6).to_list(6)
     pref_inds = user.get("preferred_industries") or []
     if not pref_inds and user.get("industry"):
         pref_inds = [user.get("industry")]
-    rec_query = {"status": "Published"}
+    rec_query = {"status": "Published", "verification_status": "Verified"}
     if pref_inds:
         rec_query["industry_category"] = {"$in": pref_inds}
     wm = user.get("preferred_work_mode")
@@ -1001,10 +1070,10 @@ async def dashboard(user=Depends(get_current_user)):
         [("featured", -1), ("date_added", -1)]).limit(8).to_list(8)
     if not recommended and pref_inds:
         recommended = await db.jobs.find(
-            {"status": "Published", "industry_category": {"$in": pref_inds}},
+            {"status": "Published", "verification_status": "Verified", "industry_category": {"$in": pref_inds}},
             {"_id": 0, "admin_notes": 0, "verification_score": 0}).limit(8).to_list(8)
     if not recommended:
-        recommended = await db.jobs.find({"status": "Published"},
+        recommended = await db.jobs.find({"status": "Published", "verification_status": "Verified"},
             {"_id": 0, "admin_notes": 0, "verification_score": 0}).sort("featured", -1).limit(6).to_list(6)
     payments = await db.payments.find({"candidate_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).to_list(20)
     return {
@@ -1073,10 +1142,20 @@ async def admin_dashboard(admin=Depends(require_admin)):
 @api.get("/admin/jobs")
 async def admin_list_jobs(admin=Depends(require_admin), q: Optional[str] = None, status: Optional[str] = None,
                           industry_category: Optional[str] = None, region: Optional[str] = None,
-                          country: Optional[str] = None):
+                          country: Optional[str] = None, verification_status: Optional[str] = None,
+                          job_source: Optional[str] = None, location: Optional[str] = None, company: Optional[str] = None):
+    await _sm_helpers["sweep_expired"]()
     query: dict = {}
     if status and status != "All":
         query["status"] = status
+    if verification_status and verification_status != "All":
+        query["verification_status"] = verification_status
+    if job_source and job_source != "All":
+        query["job_source"] = job_source
+    if location:
+        query["location"] = {"$regex": re.escape(location), "$options": "i"}
+    if company:
+        query["company"] = {"$regex": re.escape(company), "$options": "i"}
     if industry_category and industry_category != "All":
         query["industry_category"] = industry_category
     if region and region != "All":
@@ -1093,12 +1172,15 @@ async def admin_list_jobs(admin=Depends(require_admin), q: Optional[str] = None,
 @api.post("/admin/jobs")
 async def admin_create_job(req: JobReq, admin=Depends(require_admin)):
     job = req.dict()
+    _validate_job(job)
     job.update({
         "job_id": f"job_{uuid.uuid4().hex[:10]}", "date_added": now_iso(), "last_updated": now_iso(),
-        "views": 0, "saves": 0, "apply_clicks": 0,
+        "views": 0, "saves": 0, "apply_clicks": 0, "date_received": job.get("date_received") or now_iso()[:10],
+        "date_published": now_iso() if job.get("status") == "Published" else None,
     })
     await db.jobs.insert_one(dict(job))
     job.pop("_id", None)
+    await audit_log(admin, "create_job", "job", job["job_id"], {"title": job["title"], "status": job["status"]})
     return {"job": job}
 
 
@@ -1113,10 +1195,16 @@ async def admin_get_job(job_id: str, admin=Depends(require_admin)):
 @api.put("/admin/jobs/{job_id}")
 async def admin_update_job(job_id: str, req: JobReq, admin=Depends(require_admin)):
     updates = req.dict()
+    _validate_job(updates)
     updates["last_updated"] = now_iso()
-    res = await db.jobs.update_one({"job_id": job_id}, {"$set": updates})
-    if not res.matched_count:
+    prev = await db.jobs.find_one({"job_id": job_id}, {"_id": 0, "date_published": 1, "verification_status": 1})
+    if not prev:
         raise HTTPException(status_code=404, detail="Job not found")
+    if updates.get("status") == "Published" and not prev.get("date_published"):
+        updates["date_published"] = now_iso()
+    await db.jobs.update_one({"job_id": job_id}, {"$set": updates})
+    await audit_log(admin, "update_job", "job", job_id, {"status": updates.get("status"),
+                    "verification_status": updates.get("verification_status")})
     job = await db.jobs.find_one({"job_id": job_id}, {"_id": 0})
     return {"job": job}
 
@@ -1124,15 +1212,22 @@ async def admin_update_job(job_id: str, req: JobReq, admin=Depends(require_admin
 @api.delete("/admin/jobs/{job_id}")
 async def admin_delete_job(job_id: str, admin=Depends(require_admin)):
     await db.jobs.delete_one({"job_id": job_id})
+    await audit_log(admin, "delete_job", "job", job_id, {})
     return {"success": True}
 
 
 @api.post("/admin/jobs/{job_id}/status")
 async def admin_job_status(job_id: str, payload: dict, admin=Depends(require_admin)):
     status = payload.get("status")
-    if status not in ("Draft", "Published", "Unpublished", "Expired"):
+    if status not in ("Draft", "Published", "Unpublished", "Expired", "Closed"):
         raise HTTPException(status_code=400, detail="Invalid status")
-    await db.jobs.update_one({"job_id": job_id}, {"$set": {"status": status, "last_updated": now_iso()}})
+    upd = {"status": status, "last_updated": now_iso()}
+    if status == "Published":
+        prev = await db.jobs.find_one({"job_id": job_id}, {"_id": 0, "date_published": 1})
+        if prev and not prev.get("date_published"):
+            upd["date_published"] = now_iso()
+    await db.jobs.update_one({"job_id": job_id}, {"$set": upd})
+    await audit_log(admin, "job_status", "job", job_id, {"status": status})
     return {"success": True}
 
 
@@ -1149,7 +1244,8 @@ async def admin_duplicate_job(job_id: str, admin=Depends(require_admin)):
         raise HTTPException(status_code=404, detail="Job not found")
     job.update({"job_id": f"job_{uuid.uuid4().hex[:10]}", "title": job["title"] + " (Copy)",
                 "status": "Draft", "date_added": now_iso(), "last_updated": now_iso(),
-                "views": 0, "saves": 0, "apply_clicks": 0})
+                "views": 0, "saves": 0, "apply_clicks": 0, "verification_status": "Pending Verification",
+                "date_published": None})
     await db.jobs.insert_one(dict(job))
     job.pop("_id", None)
     return {"job": job}
@@ -1596,9 +1692,18 @@ async def startup():
         await db.job_tracker.create_index("tracker_id", unique=True)
         await db.tracker_evidence.create_index("tracker_id")
         await db.cron_runs.create_index("run_id", unique=True)
+        await db.job_matches.create_index([("candidate_id", 1), ("job_id", 1)], unique=True)
+        await db.job_matches.create_index("match_id", unique=True)
+        await db.job_matches.create_index([("job_id", 1), ("match_score", -1)])
+        await db.job_notifications.create_index([("candidate_id", 1), ("job_id", 1), ("channel", 1)], unique=True)
+        await db.match_reviews.create_index("match_id")
+        await db.candidate_job_activity.create_index([("candidate_id", 1), ("at", -1)])
+        await db.admin_audit_log.create_index([("at", -1)])
     except Exception as e:
         logger.warning(f"Index creation: {e}")
     await seed()
+    await db.jobs.update_many({"verification_status": {"$exists": False}}, {"$set": {"verification_status": "Verified"}})
+    await db.jobs.update_many({"job_source": {"$exists": False}}, {"$set": {"job_source": "Other authorised source"}})
     await asyncio.to_thread(_warm_storage, logger)
     logger.info("JobRadar backend ready")
 
@@ -1620,8 +1725,13 @@ api.include_router(_build_career_router(db, get_current_user, require_admin, com
 from tracker import build_router as _build_tracker_router, warm_storage as _warm_storage  # noqa: E402
 from demand import build_router as _build_demand_router  # noqa: E402
 
+from smartmatch import build_router as _build_sm_router  # noqa: E402
+
+_sm_router, _sm_helpers = _build_sm_router(db, get_current_user, require_admin, compute_membership, send_and_log_email,
+                                           _wrap_email, serialize_job, now_iso, audit_log)
 api.include_router(_build_tracker_router(db, get_current_user, require_admin, compute_membership, send_and_log_email,
-                                         _wrap_email, now_utc, now_iso, parse_dt))
+                                         _wrap_email, now_utc, now_iso, parse_dt, hooks=[_sm_helpers["on_tracker_status"]]))
+api.include_router(_sm_router)
 api.include_router(_build_demand_router(db, require_admin, compute_membership, now_utc))
 app.include_router(api)
 app.add_middleware(

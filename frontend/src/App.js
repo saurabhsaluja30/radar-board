@@ -10,6 +10,8 @@ import Explore from "@/pages/Explore";
 import JobDetail from "@/pages/JobDetail";
 import Saved from "@/pages/Saved";
 import Tracker from "@/pages/Tracker";
+import Matches from "@/pages/Matches";
+import { SmartMatchAlerts, SmartMatchAnalytics, SmartMatchCandidate, SmartMatchCandidates, SmartMatchHome, SmartMatchJob, SmartMatchReview } from "@/pages/admin/AdminSmartMatch";
 import { Forgot, Login, Register } from "@/pages/Auth";
 import { Account, Dashboard, Membership, Plans, Profile } from "@/pages/Member";
 import { About, Contact, FAQ, Legal } from "@/pages/Info";
@@ -54,6 +56,7 @@ export default function App() {
               <Route path="/job/:id" element={<JobDetail />} />
               <Route path="/saved" element={<Saved />} />
               <Route path="/tracker" element={authed(<Tracker />)} />
+              <Route path="/matches" element={authed(<Matches />)} />
               <Route path="/account" element={<Account />} />
               <Route path="/auth/login" element={<Login />} />
               <Route path="/auth/register" element={<Register />} />
@@ -88,6 +91,13 @@ export default function App() {
               <Route path="registration" element={<AdminRegistration />} />
               <Route path="demand" element={<AdminDemand />} />
               <Route path="success" element={<AdminSuccess />} />
+              <Route path="smartmatch" element={<SmartMatchHome />} />
+              <Route path="smartmatch/job/:id" element={<SmartMatchJob />} />
+              <Route path="smartmatch/candidates" element={<SmartMatchCandidates />} />
+              <Route path="smartmatch/candidate/:id" element={<SmartMatchCandidate />} />
+              <Route path="smartmatch/review" element={<SmartMatchReview />} />
+              <Route path="smartmatch/alerts" element={<SmartMatchAlerts />} />
+              <Route path="smartmatch/analytics" element={<SmartMatchAnalytics />} />
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>

@@ -10,6 +10,7 @@ import { LaunchOfferCard, MembershipCard, OpportunityNotice, useLaunchOffer } fr
 import { JobCard } from "@/components/JobCard";
 import { CareerToolsCards } from "@/components/career";
 import { Page } from "@/components/Layout";
+import { ProfileCompletion, SmartProfileForm } from "@/components/SmartProfile";
 import { GoogleButton, OrLine } from "@/pages/Auth";
 
 function LoginPrompt({ title, text }) {
@@ -297,6 +298,11 @@ export function Dashboard() {
       <PageHeader title={`Welcome, ${(user.full_name || "there").split(" ")[0]}`} subtitle="Here is your JobRadar snapshot." />
       <div className="grid gap-8 lg:grid-cols-[1fr_380px]">
         <div className="min-w-0 space-y-12">
+          <ProfileCompletion compact />
+          <Card className="flex flex-wrap items-center gap-4" data-testid="dashboard-matches">
+            <div className="flex-1"><p className="h-sec">My Job Matches</p><p className="muted mt-1">Jobs ranked by how well they fit your profile, plus opportunities JobRadar shares with you.</p></div>
+            <Button size="sm" title="View Matches" onClick={() => navigate("/matches")} data-testid="dashboard-matches-open" />
+          </Card>
           <TrackerSummary />
           <div data-testid="dashboard-career-tools">
             <SectionTitle title="Career Tools" action="Open" onAction={() => navigate("/career")} />
@@ -422,6 +428,7 @@ export function Profile() {
           </ChipRow>
           <Button title="Save Changes" loading={busy === "save"} onClick={save} data-testid="profile-save" />
         </Card>
+        {user.role === "candidate" ? <div className="space-y-6 lg:col-span-1"><ProfileCompletion /><SmartProfileForm /></div> : null}
         {user.auth_provider === "password" ? (
           <Card className="h-fit space-y-4">
             <h3 className="h-sec">Change Password</h3>

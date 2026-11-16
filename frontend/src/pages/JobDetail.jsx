@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Bookmark, Briefcase, Building2, Link2, Lock, Mail, MapPin, Send, Star, User } from "lucide-react";
@@ -76,6 +76,9 @@ export default function JobDetail() {
   const { data: launch } = useLaunchOffer();
   const qc = useQueryClient();
   const { data, isLoading } = useQuery({ queryKey: ["job", id, user?.user_id], queryFn: () => api(`/jobs/${id}`, { auth: !!user }) });
+  useEffect(() => {
+    if (user?.role === "candidate" && data?.job) api("/smartmatch/activity", { method: "POST", body: { job_id: id } }).catch(() => {});
+  }, [user?.role, data?.job, id]);
   const job = data?.job;
   if (isLoading || !job) return <Spinner />;
   const unlocked = isMember && !job.locked;

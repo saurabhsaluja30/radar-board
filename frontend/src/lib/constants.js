@@ -31,7 +31,20 @@ export const PREF_WORK_MODES = ["Work From Office", "Hybrid", "Remote", "Any"];
 export const CURRENCIES = ["INR", "USD", "GBP", "EUR", "AED", "SGD", "AUD", "CAD"];
 export const WORK_MODES = ["Work From Office", "Hybrid", "Remote"];
 export const EXPERIENCE_RANGES = ["0-2 years", "2-5 years", "5-8 years", "8+ years"];
-export const JOB_STATUSES = ["Draft", "Published", "Unpublished", "Expired"];
+export const JOB_STATUSES = ["Draft", "Published", "Unpublished", "Expired", "Closed"];
+export const JOB_STATUS_LABEL = { Draft: "Draft", Published: "Open", Unpublished: "Paused", Expired: "Expired", Closed: "Closed" };
+export const VERIFICATION_STATUSES = ["Pending Verification", "Verified", "Rejected"];
+export const JOB_SOURCES = ["EevolveX recruitment assignment", "Direct employer submission", "Recruiter submission",
+  "Approved external job feed / API", "Other authorised source"];
+export const NOTICE_PERIODS = ["Immediate", "15 days", "30 days", "45 days", "60 days", "90 days", "More than 90 days"];
+export const EMPLOYMENT_TYPES = ["Full-time", "Part-time", "Contract", "Internship", "Any"];
+export const ALERT_FREQUENCIES = ["Instant", "Daily", "Weekly"];
+export const MATCH_STATUS_LABEL = {
+  suggested: "Suggested by System", pending_review: "Pending Admin Review", approved: "Approved", rejected: "Rejected",
+  shared: "Shared with Candidate", interested: "Candidate Interested", not_interested: "Candidate Not Interested",
+  applied: "Candidate Applied Independently", interview_reported: "Interview Reported", closed: "Closed",
+};
+export const scoreColor = (s) => (s >= 80 ? "success" : s >= 65 ? "warning" : "error");
 
 export const OPPORTUNITY_NOTICE =
   "JobRadar currently provides curated job opportunities primarily across HR & Recruitment, Finance & Accounting, " +

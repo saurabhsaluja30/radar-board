@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { BarChart3, Briefcase, CreditCard, FlaskConical, Gift, LayoutDashboard, LogOut, Mail, PieChart, Receipt, ShieldCheck, Sparkles, Trophy, UserPlus, Users } from "lucide-react";
+import { BarChart3, Briefcase, ClipboardCheck, Crosshair, Megaphone, Radar, CreditCard, FlaskConical, Gift, LayoutDashboard, LogOut, Mail, PieChart, Receipt, ShieldCheck, Sparkles, Trophy, UserPlus, Users } from "lucide-react";
 import { RegistrationStats } from "@/pages/admin/AdminAnalytics";
 import { api } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
@@ -14,6 +14,13 @@ const GROUPS = [
   ["Candidate Management", [{ icon: Users, label: "Candidates", to: "/admin/candidates" }, { icon: Gift, label: "Launch Offer & Waitlist", to: "/admin/launch" }]],
   ["Job Management", [{ icon: Briefcase, label: "Job Management", to: "/admin/jobs" }]],
   ["Subscription and Payment Management", [{ icon: CreditCard, label: "Subscriptions", to: "/admin/subscriptions" }, { icon: Receipt, label: "Payments", to: "/admin/payments" }]],
+  ["JobRadar SmartMatch", [
+    { icon: Radar, label: "SmartMatch Control Room", to: "/admin/smartmatch", end: true },
+    { icon: ClipboardCheck, label: "Match Review", to: "/admin/smartmatch/review" },
+    { icon: Crosshair, label: "Find Matching Jobs", to: "/admin/smartmatch/candidates" },
+    { icon: Megaphone, label: "Alerts & Templates", to: "/admin/smartmatch/alerts" },
+    { icon: BarChart3, label: "SmartMatch Analytics", to: "/admin/smartmatch/analytics" },
+  ]],
   ["Analytics", [
     { icon: UserPlus, label: "Candidate Registration Analytics", to: "/admin/registration" },
     { icon: PieChart, label: "Candidate Demand Analytics", to: "/admin/demand" },

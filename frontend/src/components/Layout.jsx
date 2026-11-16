@@ -42,9 +42,14 @@ function TopNav() {
               </NavLink>
             ))}
             {user?.role === "candidate" ? (
-              <NavLink to="/tracker" data-testid="nav-tracker" className={({ isActive }) => `nav-link ${isActive ? "nav-link-active" : ""}`}>
-                My Tracker
-              </NavLink>
+              <>
+                <NavLink to="/matches" data-testid="nav-matches" className={({ isActive }) => `nav-link ${isActive ? "nav-link-active" : ""}`}>
+                  My Matches
+                </NavLink>
+                <NavLink to="/tracker" data-testid="nav-tracker" className={({ isActive }) => `nav-link ${isActive ? "nav-link-active" : ""}`}>
+                  My Tracker
+                </NavLink>
+              </>
             ) : null}
             {user ? (
               <NavLink to="/dashboard" data-testid="nav-dashboard" className={({ isActive }) => `nav-link ${isActive ? "nav-link-active" : ""}`}>

@@ -111,7 +111,7 @@ def _range(start: Optional[str], end: Optional[str]) -> dict:
 
 
 def build_router(db, get_current_user, require_admin, compute_membership, send_and_log_email, wrap_email,
-                 now_utc, now_iso, parse_dt):
+                 now_utc, now_iso, parse_dt, hooks=None):
     r = APIRouter()
 
     def reminder_for(t: dict) -> Optional[dict]:
@@ -171,6 +171,8 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
         if t.get("archived"):
             await db.job_tracker.update_one({"tracker_id": t["tracker_id"]}, {"$set": {"archived": False, "updated_at": now}})
             t["archived"] = False
+        for h in hooks or []:
+            await h(user["user_id"], job["job_id"], "interested")
         m = await compute_membership(user["user_id"])
         return {"item": await public_item(t, m["is_active"])}
 
@@ -214,6 +216,8 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
         await db.job_tracker.update_one({"tracker_id": tracker_id}, {"$set": upd,
                                         "$push": {"status_history": {"status": req.status, "at": now}}})
         t = await db.job_tracker.find_one({"tracker_id": tracker_id}, {"_id": 0})
+        for h in hooks or []:
+            await h(user["user_id"], t["job_id"], req.status)
         m = await compute_membership(user["user_id"])
         return {"item": await public_item(t, m["is_active"])}
 

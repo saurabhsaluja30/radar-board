@@ -3,7 +3,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Search } from "lucide-react";
 import { api } from "@/lib/api";
-import { CATEGORIES, CURRENCIES, formatDate, INDUSTRIES, INDUSTRIES_WITH_OTHER, INDUSTRY_SHORT, JOB_STATUSES, money, REGIONS, WORK_MODES } from "@/lib/constants";
+import { CATEGORIES, CURRENCIES, EMPLOYMENT_TYPES, formatDate, INDUSTRIES, INDUSTRIES_WITH_OTHER, INDUSTRY_SHORT, JOB_SOURCES, JOB_STATUS_LABEL, JOB_STATUSES, money, NOTICE_PERIODS, REGIONS, VERIFICATION_STATUSES, WORK_MODES } from "@/lib/constants";
 import { Badge, Button, Card, Chip, ChipRow, Input, notify, PageHeader, Switch } from "@/components/kit";
 
 const SearchBox = ({ value, onChange, placeholder, testId }) => (
@@ -41,7 +41,11 @@ export function AdminJobs() {
   const [status, setStatus] = useState("All");
   const [region, setRegion] = useState("All");
   const [ind, setInd] = useState("All");
-  const { data } = useQuery({ queryKey: ["admin-jobs", q, status, region, ind], queryFn: () => api("/admin/jobs", { query: { q, status, region, industry_category: ind } }) });
+  const [ver, setVer] = useState("All");
+  const [src, setSrc] = useState("All");
+  const [loc, setLoc] = useState("");
+  const { data } = useQuery({ queryKey: ["admin-jobs", q, status, region, ind, ver, src, loc],
+    queryFn: () => api("/admin/jobs", { query: { q, status, region, industry_category: ind, verification_status: ver, job_source: src, location: loc } }) });
   const jobs = data?.jobs || [];
   const act = useAct(["admin-jobs", "jobs", "job"]);
   const post = (id, path, body) => () => api(`/admin/jobs/${id}${path}`, { method: "POST", body });
@@ -52,13 +56,21 @@ export function AdminJobs() {
         <SearchBox value={q} onChange={setQ} placeholder="Search jobs..." testId="admin-job-search" />
         <div className="flex flex-wrap gap-2">
           <Chip label="All statuses" selected={status === "All"} onClick={() => setStatus("All")} data-testid="admin-status-all" />
-          {JOB_STATUSES.map((s) => <Chip key={s} label={s} selected={status === s} onClick={() => setStatus(s)} data-testid={`admin-status-${s}`} />)}
+          {JOB_STATUSES.map((s) => <Chip key={s} label={JOB_STATUS_LABEL[s]} selected={status === s} onClick={() => setStatus(s)} data-testid={`admin-status-${s}`} />)}
+          <span className="mx-2 w-px bg-gray-200" />
+          <Chip label="Any verification" selected={ver === "All"} onClick={() => setVer("All")} data-testid="admin-ver-all" />
+          {VERIFICATION_STATUSES.map((v) => <Chip key={v} label={v} selected={ver === v} onClick={() => setVer(v)} data-testid={`admin-ver-${v}`} />)}
           <span className="mx-2 w-px bg-gray-200" />
           <Chip label="All regions" selected={region === "All"} onClick={() => setRegion("All")} data-testid="admin-region-all" />
           {REGIONS.map((r) => <Chip key={r} label={r} selected={region === r} onClick={() => setRegion(region === r ? "All" : r)} data-testid={`admin-region-${r}`} />)}
           <span className="mx-2 w-px bg-gray-200" />
           <Chip label="All industries" selected={ind === "All"} onClick={() => setInd("All")} data-testid="admin-ind-all" />
           {INDUSTRIES.map((c) => <Chip key={c} label={INDUSTRY_SHORT[c]} selected={ind === c} onClick={() => setInd(ind === c ? "All" : c)} data-testid={`admin-ind-${c}`} />)}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Chip label="All sources" selected={src === "All"} onClick={() => setSrc("All")} data-testid="admin-src-all" />
+          {JOB_SOURCES.map((c) => <Chip key={c} label={c} selected={src === c} onClick={() => setSrc(src === c ? "All" : c)} data-testid={`admin-src-${c}`} />)}
+          <input value={loc} onChange={(e) => setLoc(e.target.value)} placeholder="Location..." className="field ml-auto w-48 py-2" data-testid="admin-job-location" />
         </div>
       </div>
       <Table head={["Job", "Status", "Stats", "Actions"]}>
@@ -68,13 +80,22 @@ export function AdminJobs() {
               <button onClick={() => navigate(`/admin/job-edit?id=${j.job_id}`)} className="text-left font-bold text-gray-900 hover:text-brand">{j.title}</button>
               <p className="text-gray-500">{j.company} · {j.location || j.city || j.country}</p>
             </Td>
-            <Td><div className="flex flex-wrap gap-1"><Badge label={j.status} color={j.status === "Published" ? "success" : j.status === "Draft" ? "warning" : "info"} />{j.featured ? <Badge label="Featured" color="brand" /> : null}</div></Td>
+            <Td><div className="flex flex-wrap gap-1"><Badge label={JOB_STATUS_LABEL[j.status] || j.status} color={j.status === "Published" ? "success" : j.status === "Draft" ? "warning" : "info"} />
+              <Badge label={j.verification_status || "Pending Verification"} color={j.verification_status === "Verified" ? "success" : j.verification_status === "Rejected" ? "error" : "warning"} />
+              {j.featured ? <Badge label="Featured" color="brand" /> : null}</div>
+              <p className="mt-1 text-xs text-gray-400">{j.job_source || "Source not set"}{j.expiry_date ? ` · expires ${formatDate(j.expiry_date)}` : ""}</p></Td>
             <Td className="whitespace-nowrap text-gray-500">{j.views || 0} views · {j.saves || 0} saves</Td>
             <Td>
               <div className="flex flex-wrap gap-1">
                 <Button size="sm" variant="ghost" title="Edit" onClick={() => navigate(`/admin/job-edit?id=${j.job_id}`)} data-testid={`admin-job-edit-${j.job_id}`} />
-                <Button size="sm" variant="ghost" title={j.status === "Published" ? "Unpublish" : "Publish"} data-testid={`admin-job-publish-${j.job_id}`}
+                {j.verification_status !== "Verified" ? (
+                  <Button size="sm" variant="secondary" title="Verify" data-testid={`admin-job-verify-${j.job_id}`}
+                    onClick={() => act(() => api(`/admin/smartmatch/jobs/${j.job_id}/verify`, { method: "POST", body: { verification_status: "Verified" } }), "Job verified")} />
+                ) : null}
+                <Button size="sm" variant="ghost" title={j.status === "Published" ? "Pause" : "Publish (Open)"} data-testid={`admin-job-publish-${j.job_id}`}
                   onClick={() => act(post(j.job_id, "/status", { status: j.status === "Published" ? "Unpublished" : "Published" }), "Status updated")} />
+                <Button size="sm" variant="ghost" title="Close" onClick={() => act(post(j.job_id, "/status", { status: "Closed" }), "Job closed")} data-testid={`admin-job-close-${j.job_id}`} />
+                <Button size="sm" variant="outline" title="Find Matching Candidates" onClick={() => navigate(`/admin/smartmatch/job/${j.job_id}`)} data-testid={`admin-job-match-${j.job_id}`} />
                 <Button size="sm" variant="ghost" title="Mark Expired" onClick={() => act(post(j.job_id, "/status", { status: "Expired" }), "Marked expired")} data-testid={`admin-job-expire-${j.job_id}`} />
                 <Button size="sm" variant="ghost" title={j.featured ? "Unfeature" : "Feature"} onClick={() => act(post(j.job_id, "/feature", { featured: !j.featured }), "Updated")} data-testid={`admin-job-feature-${j.job_id}`} />
                 <Button size="sm" variant="ghost" title="Duplicate" onClick={() => act(post(j.job_id, "/duplicate"), "Duplicated")} data-testid={`admin-job-duplicate-${j.job_id}`} />
@@ -95,14 +116,21 @@ const EMPTY_JOB = {
   location: "", city: "", country: "India", currency: "INR", visa_info: "", work_mode: "Work From Office", experience_required: "",
   salary_range: "", employment_type: "Full-time", description: "", key_responsibilities: "", required_skills: "", preferred_skills: "",
   recruiter_name: "", recruiter_email: "", application_link: "", source_link: "", application_deadline: "", status: "Published",
-  featured: false, verification_score: 80, admin_notes: "",
+  featured: false, verification_score: 80, admin_notes: "", verification_status: "Pending Verification", experience_min: "",
+  experience_max: "", salary_min: "", salary_max: "", qualifications: "", mandatory_requirements: "", notice_period_pref: "",
+  job_source: "", date_received: "", expiry_date: "",
 };
+const NUM_FIELDS = ["experience_min", "experience_max", "salary_min", "salary_max"];
 const SHORT_FIELDS = [["sub_function", "Sub-function"], ["industry", "Industry (sector, e.g. IT Services)"], ["designation", "Designation"],
   ["location", "Location / Area"], ["city", "City"], ["country", "Country"], ["experience_required", "Experience Required"],
-  ["salary_range", "Salary Range"], ["employment_type", "Employment Type"], ["recruiter_name", "Recruiter Name"],
-  ["recruiter_email", "Recruiter Email"], ["application_link", "Application Link"], ["source_link", "Source Link"]];
+  ["salary_range", "Salary Range (as shown to candidates)"], ["recruiter_name", "Recruiter Name"],
+  ["recruiter_email", "Recruiter Email"], ["application_link", "External Application URL"], ["source_link", "Source Reference / Original URL"],
+  ["experience_min", "Min Experience (years)"], ["experience_max", "Max Experience (years)"],
+  ["salary_min", "Salary Min (annual, full amount)"], ["salary_max", "Salary Max (annual, full amount)"],
+  ["date_received", "Date Received (YYYY-MM-DD)"], ["expiry_date", "Expiry Date (YYYY-MM-DD)"]];
 const LONG_FIELDS = [["visa_info", "Work Authorization / Visa Info"], ["description", "Job Description"], ["key_responsibilities", "Key Responsibilities"],
-  ["required_skills", "Required Skills"], ["preferred_skills", "Preferred Skills"], ["admin_notes", "Internal Admin Notes (never shown to candidates)"]];
+  ["required_skills", "Required Skills"], ["preferred_skills", "Preferred Skills"], ["qualifications", "Required Qualifications (if any)"],
+  ["mandatory_requirements", "Mandatory Licence / Language / Other (checked manually)"], ["admin_notes", "Internal Admin Notes (never shown to candidates)"]];
 
 export function AdminJobEdit() {
   const navigate = useNavigate();
@@ -113,14 +141,22 @@ export function AdminJobEdit() {
   const [loading, setLoading] = useState(false);
   const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
   useEffect(() => {
-    if (id) api(`/admin/jobs/${id}`).then((res) => setForm({ ...EMPTY_JOB, ...res.job })).catch(() => {});
+    if (id) api(`/admin/jobs/${id}`).then((res) => setForm({ ...EMPTY_JOB, ...Object.fromEntries(Object.entries(res.job).map(([k, v]) => [k, v ?? ""])) })).catch(() => {});
   }, [id]);
   const save = async () => {
     if (!form.title || !form.company) return notify("Title and company are required", "error");
+    const body = { ...form };
+    for (const k of NUM_FIELDS) {
+      if (body[k] === "" || body[k] === null) body[k] = null;
+      else if (Number.isNaN(Number(body[k]))) return notify("Experience and salary must be numbers", "error");
+      else body[k] = Number(body[k]);
+    }
     setLoading(true);
     try {
-      if (id) await api(`/admin/jobs/${id}`, { method: "PUT", body: form });
-      else await api("/admin/jobs", { method: "POST", body: form });
+      const dup = await api("/admin/smartmatch/duplicates", { query: { company: form.company, title: form.title, location: form.location, source_link: form.source_link, exclude: id || "" } });
+      if (dup.duplicates.length && !window.confirm(`Possible duplicate: ${dup.duplicates.map((d) => `${d.title} at ${d.company} (${d.job_id})`).join(", ")}. Save anyway?`)) return;
+      if (id) await api(`/admin/jobs/${id}`, { method: "PUT", body });
+      else await api("/admin/jobs", { method: "POST", body });
       notify(id ? "Job updated" : "Job created", "success");
       ["admin-jobs", "jobs", "job", "saved-jobs", "dashboard"].forEach((k) => qc.invalidateQueries({ queryKey: [k] }));
       navigate("/admin/jobs");
@@ -152,7 +188,11 @@ export function AdminJobEdit() {
           {chips("Region", "region", REGIONS)}
           {chips("Currency", "currency", CURRENCIES, undefined, "cur")}
           {chips("Work Mode", "work_mode", WORK_MODES, undefined, "wm")}
-          {chips("Status", "status", JOB_STATUSES)}
+          {chips("Status", "status", JOB_STATUSES, (x) => JOB_STATUS_LABEL[x])}
+          {chips("Verification", "verification_status", VERIFICATION_STATUSES, undefined, "ver")}
+          {chips("Job Source", "job_source", JOB_SOURCES, undefined, "src")}
+          {chips("Notice Period Preference", "notice_period_pref", NOTICE_PERIODS, undefined, "notice")}
+          {chips("Employment Type", "employment_type", EMPLOYMENT_TYPES.filter((x) => x !== "Any"), undefined, "emp")}
           <div className="flex items-center justify-between rounded-xl bg-brand-mist p-4">
             <span className="font-bold">Featured Job</span>
             <Switch checked={!!form.featured} onChange={(v) => set("featured", v)} data-testid="jobedit-featured" />
