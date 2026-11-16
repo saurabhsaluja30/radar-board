@@ -1,0 +1,52 @@
+{
+  "summary": "Tested JobRadar SmartMatch end to end: backend through pytest on the public URL, frontend through Playwright as admin and as candidate. Working: job create defaults to Pending Verification and stays off /api/jobs; the duplicate confirm appears (match ignores case); Verify button; find-candidates sorted by score desc, with a 7-part breakdown, reasons, mandatory counts and a provisional note; reject needs a reason (submit disabled while empty) and the reason shows in the row; single and bulk approve; history modal; share (in-app sent, email failed with an upstream 429 rate limit, which is an acceptable log); re-share is skipped as 'already sent'; a candidate without consent is skipped; candidate page find-jobs; /matches tabs, cards, save, interested, applied (match status reached applied and the tracker says applied, with no application click recorded); SmartProfile saves and writes a consent_records doc; paused, unverified and expired jobs return 400 on find-candidates, approve is skipped and the jobs are hidden from /me and /api/jobs; RBAC returns 403/401; analytics numbers match DB counts; /matches at 390px has no horizontal overflow; admin regressions pass. Backend: 60/61 tests pass, and the one failure is a real expiry edge case.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "GET /api/jobs/{job_id} (+ dashboard recommended/recent queries ~server.py:1058-1076)", "issue": "These queries filter only on status=Published + Verified. They do not check expiry_date and do not call sweep_expired. A Published job whose expiry_date has passed stays publicly visible (detail returns 200) until another endpoint (/api/jobs, /admin/jobs, smartmatch) runs the sweep. Reproduced by tests/test_smartmatch_expiry.py."},
+      {"endpoint": "POST/PUT /api/admin/jobs", "issue": "A job saved with status Published and an expiry_date in the past is stored as Published. The save should set status Expired straight away."},
+      {"endpoint": "POST /api/admin/jobs/{id}/feature, /duplicate", "issue": "These actions write no admin_audit_log entry. Status, verify, create, update and delete do."},
+      {"endpoint": "POST /api/smartmatch/respond", "issue": "Does not check that job_id exists before writing candidate_job_activity."},
+      {"endpoint": "PUT /api/auth/profile", "issue": "Numeric fields such as total_experience and expected_ctc cannot be cleared once set, because None values are dropped."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "Profile page (/profile) direct load / refresh", "issue": "Loading or refreshing /profile directly sends a logged-in user to /auth/login. Profile() runs `if (!user) navigate('/auth/login')` before auth has finished loading, and the route is not wrapped in RequireUser. The page only works when reached by in-app navigation. This hurts SmartProfile, because the alert email tells candidates to update Job Alerts in their profile. The form state is also built from `user` at mount only. /dashboard and /account probably have the same pattern.", "selector": "[data-testid=smart-profile]", "priority": "MEDIUM"},
+      {"component": "MatchTable history modal", "issue": "There is no close button and Escape does not close it; only a backdrop click works.", "selector": "[data-testid^=history-]", "priority": "LOW"}
+    ],
+    "integration_issues": [
+      {"flow": "Share modal results", "issue": "A failed email shows the raw provider JSON, e.g. 429: {\"error\":\"Rate limited\",...}. A friendly message would be better.", "affected_selectors": ["[data-testid=share-results]"]}
+    ],
+    "design_issues": [
+      {"screen": "Profile > SmartProfile", "issues": ["The 'Profile active (visible for matching)' switch is squeezed in its narrow card: the knob sits outside the card edge and the label wraps to 4 lines", "The left profile card has a large empty white area beside the tall SmartProfile column"]},
+      {"screen": "Admin job edit", "issues": ["Date Received and Expiry Date are plain text inputs (YYYY-MM-DD); use a shadcn date picker"]},
+      {"screen": "SmartMatch Analytics", "issues": ["From/To use the browser's native date picker (mm/dd/yyyy) instead of the shadcn calendar"]},
+      {"screen": "Alerts & Templates", "issues": ["Related-industries pickers are native <select> elements"]},
+      {"screen": "Job Management", "issues": ["'Find Matching Candidates' still shows for Pending Verification and Paused jobs, and clicking it only returns a 400 toast; disable it or hint why"]}
+    ]
+  },
+  "test_report_links": ["/app/backend/tests/test_smartmatch.py", "/app/backend/tests/test_smartmatch_expiry.py", "/app/test_reports/pytest/pytest_results.xml"],
+  "action_items": [
+    "Fix /profile on direct load: wait for auth to finish loading (wrap in RequireUser) before redirecting, and re-seed form state when user arrives",
+    "Add an expiry check to /api/jobs/{id} and the dashboard queries (call sweep_expired or add the eligible_q expiry clause); on admin create/update, set status Expired when expiry_date < today",
+    "Fix the 'Profile active' switch layout in SmartProfile",
+    "Add a close button and Escape handling to the history modal; show a friendly email failure message in the share results",
+    "Audit-log feature and duplicate actions",
+    "Optional: shadcn date pickers for expiry/received dates and the analytics range"
+  ],
+  "critical_code_review_comments": [
+    "smartmatch.py is 983 lines and server.py 1743; split smartmatch into engine.py and routes",
+    "find_candidates calls upsert_match once per candidate, each a find + update/insert (up to 50k). Use bulk_write for scale. /smartmatch/me scores every eligible job on each request",
+    "sweep_expired runs only on some endpoints and there is no scheduled job, so expiry depends on traffic",
+    "The email frequency check counts only 'sent' emails. Failed emails, such as 429s, do not count, so retries are allowed. This is correct, but frequency could not be verified end to end because the provider rate-limited"
+  ],
+  "updated_files": ["/app/backend/tests/test_smartmatch.py", "/app/backend/tests/test_smartmatch_expiry.py"],
+  "success_rate": {"backend": "98% (60/61; 1 expected failure for the expiry bug)", "frontend": "~92% (all SmartMatch flows work; /profile direct-load bug)"},
+  "test_credentials": "admin@eevolvex.com / Admin@12345; test@jobradar.com / Test@12345 (from /app/memory/test_credentials.md)",
+  "seed_data_creation": "Created TEST_UI jobs job_fb7fffe588 and its duplicate job_05e9c0cc36; deleted both along with their matches, notifications, reviews, tracker, saved, activity and email_logs. test_smartmatch.py registers two TEST_SM users plus jobs and cleans them up by id (launch_offer.granted reset). test@jobradar.com profile restored (total_experience 4, skills Python/React, titles [Software Engineer], consent true); its consent_records now holds 2 extra entries (off, then on). Re-running the pre-existing suites test_jobradar_api.py and test_tracker_demand.py left about 5 more TEST_ users, because those suites do not clean up; launch_offer.granted = 23 matches the users count. The TEST_SM Software Engineer job (job_61af7e8807) was there before testing and was left alone.",
+  "retest_needed": true,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "SmartMatch is tested end to end. Run tests/test_smartmatch.py (self-cleaning) and tests/test_smartmatch_expiry.py, which should pass once the expiry fix lands. /login is not a route; use /auth/login. Job detail is /job/:id. /profile currently has to be reached by SPA navigation (history.pushState + popstate). The email provider returns 429 rate limits, so email results show 'failed'. Candidate sessions are single-session: an API login revokes the browser session.",
+  "rca of the issue": "/profile redirect: Member.jsx Profile() reads useAuth().user, which is null during the initial /auth/me fetch, and its useEffect redirects at once. Expired job visibility: get_job and the dashboard queries in server.py do not include the expiry clause from eligible_q() and do not call sweep_expired, so expiry only applies after a sweep."
+}

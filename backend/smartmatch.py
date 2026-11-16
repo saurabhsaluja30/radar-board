@@ -732,7 +732,10 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
                     log = await send_and_log_email(candidate_id=c["user_id"], to=c["email"], email_type="smartmatch_alert",
                                                    subject=subject, html=wrap_email("New job match", inner))
                     if (log or {}).get("delivery_status") == "failed":
-                        status, error = "failed", (log or {}).get("error_message") or "delivery failed"
+                        raw = (log or {}).get("error_message") or ""
+                        status = "failed"
+                        error = ("Email service is busy (rate limited) — please retry in a minute" if raw.startswith("429")
+                                 else "Email could not be delivered — please retry later")
                 now = now_iso()
                 await db.job_notifications.update_one(
                     {"candidate_id": c["user_id"], "job_id": j["job_id"], "channel": ch},
@@ -911,6 +914,8 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
     async def respond(req: RespondReq, user=Depends(get_current_user)):
         if req.response not in ("interested", "not_interested"):
             raise HTTPException(status_code=400, detail="Invalid response")
+        if not await db.jobs.find_one({"job_id": req.job_id}, {"_id": 1}):
+            raise HTTPException(status_code=404, detail="Job not found")
         await log_activity(user["user_id"], req.job_id, req.response)
         m = await db.job_matches.find_one({"candidate_id": user["user_id"], "job_id": req.job_id}, {"_id": 0})
         if m and m["status"] in ("shared", "interested", "not_interested"):

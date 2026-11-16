@@ -64,7 +64,7 @@ export default function App() {
               <Route path="/plans" element={<Plans />} />
               <Route path="/membership" element={<Membership />} />
               <Route path="/dashboard" element={<Dashboard />} />
-              <Route path="/profile" element={<Profile />} />
+              <Route path="/profile" element={authed(<Profile />)} />
               <Route path="/about" element={<About />} />
               <Route path="/faq" element={<FAQ />} />
               <Route path="/contact" element={<Contact />} />

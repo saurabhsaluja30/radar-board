@@ -428,7 +428,7 @@ export function Profile() {
           </ChipRow>
           <Button title="Save Changes" loading={busy === "save"} onClick={save} data-testid="profile-save" />
         </Card>
-        {user.role === "candidate" ? <div className="space-y-6 lg:col-span-1"><ProfileCompletion /><SmartProfileForm /></div> : null}
+        {user.role === "candidate" ? <div className="space-y-6 lg:col-span-2"><ProfileCompletion /><SmartProfileForm /></div> : null}
         {user.auth_provider === "password" ? (
           <Card className="h-fit space-y-4">
             <h3 className="h-sec">Change Password</h3>

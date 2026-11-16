@@ -43,7 +43,8 @@ function HistoryModal({ m, onClose }) {
   const { data } = useQuery({ queryKey: ["match-history", m.match_id], queryFn: () => api(`/admin/smartmatch/matches/${m.match_id}/history`) });
   return (
     <Modal open onClose={onClose} wide>
-      <p className="text-xl font-extrabold">Match history</p>
+      <div className="flex items-center justify-between"><p className="text-xl font-extrabold">Match history</p>
+        <button onClick={onClose} className="text-sm font-bold text-gray-500 hover:text-brand" data-testid="history-close">Close</button></div>
       <p className="muted">{m.candidate?.full_name} · {m.job_title} at {m.company}</p>
       {!data ? <Spinner /> : (
         <div className="mt-4 grid gap-6 md:grid-cols-2 text-sm">

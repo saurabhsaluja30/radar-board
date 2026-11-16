@@ -95,7 +95,7 @@ export function AdminJobs() {
                 <Button size="sm" variant="ghost" title={j.status === "Published" ? "Pause" : "Publish (Open)"} data-testid={`admin-job-publish-${j.job_id}`}
                   onClick={() => act(post(j.job_id, "/status", { status: j.status === "Published" ? "Unpublished" : "Published" }), "Status updated")} />
                 <Button size="sm" variant="ghost" title="Close" onClick={() => act(post(j.job_id, "/status", { status: "Closed" }), "Job closed")} data-testid={`admin-job-close-${j.job_id}`} />
-                <Button size="sm" variant="outline" title="Find Matching Candidates" onClick={() => navigate(`/admin/smartmatch/job/${j.job_id}`)} data-testid={`admin-job-match-${j.job_id}`} />
+                <Button size="sm" variant="outline" title="Find Matching Candidates" disabled={j.status !== "Published" || j.verification_status !== "Verified"} onClick={() => navigate(`/admin/smartmatch/job/${j.job_id}`)} data-testid={`admin-job-match-${j.job_id}`} />
                 <Button size="sm" variant="ghost" title="Mark Expired" onClick={() => act(post(j.job_id, "/status", { status: "Expired" }), "Marked expired")} data-testid={`admin-job-expire-${j.job_id}`} />
                 <Button size="sm" variant="ghost" title={j.featured ? "Unfeature" : "Feature"} onClick={() => act(post(j.job_id, "/feature", { featured: !j.featured }), "Updated")} data-testid={`admin-job-feature-${j.job_id}`} />
                 <Button size="sm" variant="ghost" title="Duplicate" onClick={() => act(post(j.job_id, "/duplicate"), "Duplicated")} data-testid={`admin-job-duplicate-${j.job_id}`} />

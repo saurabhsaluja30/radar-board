@@ -795,6 +795,7 @@ async def list_jobs(
 
 @api.get("/jobs/{job_id}")
 async def get_job(job_id: str, user=Depends(get_optional_user)):
+    await _sm_helpers["sweep_expired"]()
     job = await db.jobs.find_one({"job_id": job_id, "status": "Published", "verification_status": "Verified"},
                                  {"_id": 0, "admin_notes": 0, "verification_score": 0})
     if not job:
@@ -1049,6 +1050,7 @@ async def checkout_demo(req: CheckoutReq, user=Depends(get_current_user)):
 
 @api.get("/dashboard")
 async def dashboard(user=Depends(get_current_user)):
+    await _sm_helpers["sweep_expired"]()
     m = await compute_membership(user["user_id"])
     saved = await db.saved_jobs.find({"candidate_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).to_list(20)
     saved_ids = [s["job_id"] for s in saved]
@@ -1180,6 +1182,7 @@ async def admin_create_job(req: JobReq, admin=Depends(require_admin)):
     })
     await db.jobs.insert_one(dict(job))
     job.pop("_id", None)
+    await _sm_helpers["sweep_expired"]()
     await audit_log(admin, "create_job", "job", job["job_id"], {"title": job["title"], "status": job["status"]})
     return {"job": job}
 
@@ -1203,6 +1206,7 @@ async def admin_update_job(job_id: str, req: JobReq, admin=Depends(require_admin
     if updates.get("status") == "Published" and not prev.get("date_published"):
         updates["date_published"] = now_iso()
     await db.jobs.update_one({"job_id": job_id}, {"$set": updates})
+    await _sm_helpers["sweep_expired"]()
     await audit_log(admin, "update_job", "job", job_id, {"status": updates.get("status"),
                     "verification_status": updates.get("verification_status")})
     job = await db.jobs.find_one({"job_id": job_id}, {"_id": 0})
@@ -1234,6 +1238,7 @@ async def admin_job_status(job_id: str, payload: dict, admin=Depends(require_adm
 @api.post("/admin/jobs/{job_id}/feature")
 async def admin_feature_job(job_id: str, payload: dict, admin=Depends(require_admin)):
     await db.jobs.update_one({"job_id": job_id}, {"$set": {"featured": bool(payload.get("featured")), "last_updated": now_iso()}})
+    await audit_log(admin, "feature_job", "job", job_id, {"featured": bool(payload.get("featured"))})
     return {"success": True}
 
 
@@ -1248,6 +1253,7 @@ async def admin_duplicate_job(job_id: str, admin=Depends(require_admin)):
                 "date_published": None})
     await db.jobs.insert_one(dict(job))
     job.pop("_id", None)
+    await audit_log(admin, "duplicate_job", "job", job["job_id"], {"from": job_id})
     return {"job": job}
 
 
