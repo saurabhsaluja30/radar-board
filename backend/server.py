@@ -146,12 +146,7 @@ async def send_and_log_email(*, candidate_id: Optional[str], to: str, email_type
     try:
         _assert_safe_email(subject, html)
         if EMAIL_KEY:
-            async with httpx.AsyncClient(timeout=30) as c:
-                resp = await c.post(
-                    f"{EMAIL_BASE_URL}/api/v1/email/send",
-                    headers={"X-Email-Key": EMAIL_KEY},
-                    json={"to": [to], "subject": subject, "html": html, "from_name": EMAIL_FROM_NAME},
-                )
+            resp = await _paced_send(to, subject, html)
             if resp.status_code in (200, 202):
                 log["delivery_status"] = "sent"
                 try:
@@ -160,12 +155,52 @@ async def send_and_log_email(*, candidate_id: Optional[str], to: str, email_type
                     pass
             else:
                 log["delivery_status"] = "failed"
-                log["error_message"] = f"{resp.status_code}: {resp.text[:200]}"
+                log["error_message"] = ("Email service rate limit reached — use Retry failed" if resp.status_code == 429
+                                        else f"{resp.status_code}: {resp.text[:200]}")
     except Exception as e:
         log["delivery_status"] = "failed"
         log["error_message"] = str(e)[:200]
+    if log["delivery_status"] == "failed":
+        log["retry_html"] = html
     await db.email_logs.insert_one(dict(log))
+    log.pop("retry_html", None)
     return log
+
+
+_bg_tasks: set = set()
+
+
+def _bg(coro):
+    t = asyncio.create_task(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+
+
+_email_lock = asyncio.Lock()
+_email_last = {"t": 0.0}
+EMAIL_MIN_GAP = 0.6
+
+
+async def _paced_send(to: str, subject: str, html: str):
+    """Serialise sends with a minimum gap and back off on 429 so bulk sends stay under the provider limit."""
+    resp = None
+    for attempt in range(5):
+        async with _email_lock:
+            wait = EMAIL_MIN_GAP - (asyncio.get_event_loop().time() - _email_last["t"])
+            if wait > 0:
+                await asyncio.sleep(wait)
+            async with httpx.AsyncClient(timeout=30) as c:
+                resp = await c.post(f"{EMAIL_BASE_URL}/api/v1/email/send", headers={"X-Email-Key": EMAIL_KEY},
+                                    json={"to": [to], "subject": subject, "html": html, "from_name": EMAIL_FROM_NAME})
+            _email_last["t"] = asyncio.get_event_loop().time()
+        if resp.status_code != 429:
+            return resp
+        try:
+            delay = float(resp.headers.get("retry-after") or 0)
+        except ValueError:
+            delay = 0
+        await asyncio.sleep(max(delay, 2 ** attempt))
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -1351,23 +1386,46 @@ async def admin_payments(admin=Depends(require_admin), status: Optional[str] = N
 
 @api.get("/admin/emails")
 async def admin_emails(admin=Depends(require_admin)):
-    logs = await db.email_logs.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
-    return {"emails": logs}
+    logs = await db.email_logs.find({}, {"_id": 0, "retry_html": 0}).sort("created_at", -1).to_list(500)
+    retryable = await db.email_logs.count_documents({"delivery_status": "failed", "retry_html": {"$exists": True}})
+    return {"emails": logs, "retryable": retryable}
 
 
 @api.post("/admin/announcement")
 async def admin_announcement(req: AnnouncementReq, admin=Depends(require_admin)):
     candidates = await db.users.find({"role": "candidate", "suspended": {"$ne": True}},
                                      {"_id": 0, "user_id": 1, "email": 1, "full_name": 1}).to_list(2000)
-    sent = 0
     inner = f'<p style="color:#374151;font-size:15px">{escape(req.message)}</p>'
     html = _wrap_email(req.subject, inner)
-    for c in candidates:
-        if c.get("email"):
+    already = set(await db.email_logs.distinct("candidate_id", {"email_type": "announcement", "subject": req.subject,
+                                                                "delivery_status": "sent"}))
+    targets = [c for c in candidates if c.get("email") and c["user_id"] not in already]
+
+    async def run():
+        for c in targets:
             await send_and_log_email(candidate_id=c["user_id"], to=c["email"], email_type="announcement",
                                      subject=req.subject, html=html)
-            sent += 1
-    return {"success": True, "sent": sent}
+
+    _bg(run())
+    await audit_log(admin, "send_announcement", "email", req.subject[:80], {"queued": len(targets), "skipped": len(already)})
+    return {"success": True, "sent": len(targets), "queued": len(targets), "skipped_already_received": len(already)}
+
+
+@api.post("/admin/emails/retry-failed")
+async def admin_retry_failed(admin=Depends(require_admin)):
+    failed = await db.email_logs.find({"delivery_status": "failed", "retry_html": {"$exists": True}},
+                                      {"_id": 0}).sort("date_sent", 1).to_list(1000)
+    ids = [f["email_id"] for f in failed]
+    await db.email_logs.update_many({"email_id": {"$in": ids}}, {"$set": {"delivery_status": "retried"}, "$unset": {"retry_html": ""}})
+
+    async def run():
+        for f in failed:
+            await send_and_log_email(candidate_id=f.get("candidate_id"), to=f["to"], email_type=f["email_type"],
+                                     subject=f["subject"], html=f["retry_html"])
+
+    _bg(run())
+    await audit_log(admin, "retry_failed_emails", "email", "-", {"count": len(failed)})
+    return {"queued": len(failed)}
 
 
 @api.get("/admin/plans")

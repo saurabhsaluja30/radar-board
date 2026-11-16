@@ -8,14 +8,35 @@ export function AdminEmails() {
   const qc = useQueryClient();
   const [compose, setCompose] = useState({ subject: "", message: "" });
   const [sending, setSending] = useState(false);
-  const { data } = useQuery({ queryKey: ["admin-emails"], queryFn: () => api("/admin/emails") });
+  const [polling, setPolling] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const { data } = useQuery({ queryKey: ["admin-emails"], queryFn: () => api("/admin/emails"), refetchInterval: polling ? 4000 : false });
   const emails = data?.emails || [];
+  useEffect(() => {
+    if (!polling) return undefined;
+    const t = setTimeout(() => setPolling(false), 120000);
+    return () => clearTimeout(t);
+  }, [polling]);
+  const retry = async () => {
+    setRetrying(true);
+    try {
+      const res = await api("/admin/emails/retry-failed", { method: "POST" });
+      notify(`Retrying ${res.queued} failed email${res.queued === 1 ? "" : "s"} — sending slowly to stay within limits`, "success");
+      setPolling(true);
+      qc.invalidateQueries({ queryKey: ["admin-emails"] });
+    } catch (e) {
+      notify(e.message || "Failed", "error");
+    } finally {
+      setRetrying(false);
+    }
+  };
   const send = async () => {
     if (!compose.subject || !compose.message) return notify("Enter subject and message", "error");
     setSending(true);
     try {
       const res = await api("/admin/announcement", { method: "POST", body: compose });
-      notify(`Announcement sent to ${res.sent} candidates`, "success");
+      notify(`Sending to ${res.queued} candidate${res.queued === 1 ? "" : "s"}${res.skipped_already_received ? ` · skipped ${res.skipped_already_received} who already received this subject` : ""}. Delivery status updates below.`, "success");
+      setPolling(true);
       setCompose({ subject: "", message: "" });
       qc.invalidateQueries({ queryKey: ["admin-emails"] });
     } catch (e) {
@@ -35,7 +56,11 @@ export function AdminEmails() {
           <Button full title="Send to all candidates" loading={sending} onClick={send} data-testid="email-send" />
         </Card>
         <div>
-          <p className="h-sec mb-4">Email Logs ({emails.length})</p>
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+            <p className="h-sec">Email Logs ({emails.length}){polling ? <span className="ml-2 text-xs font-semibold text-brand">updating…</span> : null}</p>
+            {data?.retryable ? <Button size="sm" variant="outline" title={`Retry failed (${data.retryable})`} loading={retrying} onClick={retry} data-testid="email-retry-failed" /> : null}
+          </div>
+          <p className="mb-3 text-xs text-gray-500">Emails are sent one at a time to stay within the email provider's limits. Re-sending an announcement with the same subject goes only to candidates who haven't received it yet.</p>
           <div className="space-y-2">
             {emails.map((e) => (
               <Card key={e.email_id} className="flex items-center justify-between gap-4 py-3.5" data-testid={`email-log-${e.email_id}`}>
