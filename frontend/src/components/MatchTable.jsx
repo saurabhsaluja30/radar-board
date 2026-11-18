@@ -127,7 +127,7 @@ function ShareModal({ ids, onClose, onDone, defaultChannels }) {
   );
 }
 
-export function MatchTable({ filters, mode = "job", title, defaultChannels }) {
+export function MatchTable({ filters, mode = "job", title, defaultChannels, readOnly }) {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const [page, setPage] = useState(1);
@@ -138,7 +138,7 @@ export function MatchTable({ filters, mode = "job", title, defaultChannels }) {
   const { data, isLoading } = useQuery({ queryKey: ["sm-matches", query], queryFn: () => api("/admin/smartmatch/matches", { query }) });
   const rows = data?.matches || [];
   const pages = data ? Math.max(1, Math.ceil(data.total / data.page_size)) : 1;
-  const refresh = () => { qc.invalidateQueries({ queryKey: ["sm-matches"] }); qc.invalidateQueries({ queryKey: ["sm-analytics"] }); };
+  const refresh = () => ["sm-matches", "sm-analytics", "am-jobs", "am-recipients"].forEach((k) => qc.invalidateQueries({ queryKey: [k] }));
   const review = async (ids, action, extra = {}) => {
     try {
       const res = await api("/admin/smartmatch/matches/review", { method: "POST", body: { match_ids: ids, action, ...extra } });
@@ -156,7 +156,7 @@ export function MatchTable({ filters, mode = "job", title, defaultChannels }) {
     <Card className="p-0" data-testid="match-table">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-gray-100 p-5">
         <p className="h-sec">{title || "Matches"} {data ? <span className="text-sm font-semibold text-gray-400">({data.total})</span> : null}</p>
-        <div className="flex flex-wrap gap-2">
+        <div className={`flex flex-wrap gap-2 ${readOnly ? "hidden" : ""}`}>
           <Button size="sm" variant="secondary" title={`Approve selected (${sel.length})`} disabled={!sel.length} onClick={() => review(sel, "approve")} data-testid="bulk-approve" />
           <Button size="sm" variant="outline" title={`Send alert (${approvedSel.length})`} disabled={!approvedSel.length} onClick={() => setDialog({ type: "share", ids: approvedSel })} data-testid="bulk-share" />
           <Button size="sm" variant="ghost" title="Export CSV" icon={<Download className="h-4 w-4" />} data-testid="matches-export"
@@ -219,12 +219,13 @@ export function MatchTable({ filters, mode = "job", title, defaultChannels }) {
                       </td>
                       <td className="px-3 py-3">
                         <div className="flex flex-wrap gap-1">
+                          {readOnly ? <span className="w-full text-[11px] font-semibold text-red-600">Opted out — view only</span> : null}
                           <Button size="sm" variant="ghost" title="Why" icon={open === m.match_id ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />} onClick={() => setOpen(open === m.match_id ? null : m.match_id)} data-testid={`why-${m.match_id}`} />
-                          {["suggested", "pending_review", "rejected"].includes(m.status) ? <Button size="sm" variant="secondary" title="Approve" onClick={() => review([m.match_id], "approve")} data-testid={`approve-${m.match_id}`} /> : null}
-                          {["suggested", "pending_review", "approved"].includes(m.status) ? <Button size="sm" variant="ghost" title="Reject" className="!text-red-600" onClick={() => setDialog({ type: "reject", ids: [m.match_id] })} data-testid={`reject-${m.match_id}`} /> : null}
-                          {m.status === "suggested" ? <Button size="sm" variant="ghost" title="Mark pending review" onClick={() => review([m.match_id], "pending_review")} data-testid={`pending-${m.match_id}`} /> : null}
-                          {["approved", "shared"].includes(m.status) ? <Button size="sm" variant="outline" title="Send alert" onClick={() => setDialog({ type: "share", ids: [m.match_id] })} data-testid={`share-${m.match_id}`} /> : null}
-                          <Button size="sm" variant="ghost" title="Comment" onClick={() => setDialog({ type: "comment", ids: [m.match_id] })} data-testid={`comment-${m.match_id}`} />
+                          {!readOnly && ["suggested", "pending_review", "rejected"].includes(m.status) ? <Button size="sm" variant="secondary" title="Approve" onClick={() => review([m.match_id], "approve")} data-testid={`approve-${m.match_id}`} /> : null}
+                          {!readOnly && ["suggested", "pending_review", "approved"].includes(m.status) ? <Button size="sm" variant="ghost" title="Reject" className="!text-red-600" onClick={() => setDialog({ type: "reject", ids: [m.match_id] })} data-testid={`reject-${m.match_id}`} /> : null}
+                          {!readOnly && m.status === "suggested" ? <Button size="sm" variant="ghost" title="Mark pending review" onClick={() => review([m.match_id], "pending_review")} data-testid={`pending-${m.match_id}`} /> : null}
+                          {!readOnly && ["approved", "shared"].includes(m.status) ? <Button size="sm" variant="outline" title="Send alert" onClick={() => setDialog({ type: "share", ids: [m.match_id] })} data-testid={`share-${m.match_id}`} /> : null}
+                          {readOnly ? null : <Button size="sm" variant="ghost" title="Comment" onClick={() => setDialog({ type: "comment", ids: [m.match_id] })} data-testid={`comment-${m.match_id}`} />}
                           <Button size="sm" variant="ghost" title="" icon={<History className="h-3.5 w-3.5" />} onClick={() => setDialog({ type: "history", m })} data-testid={`history-${m.match_id}`} />
                         </div>
                       </td>

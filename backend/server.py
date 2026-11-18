@@ -1422,7 +1422,7 @@ async def admin_announcement(req: AnnouncementReq, admin=Depends(require_admin))
 
     _bg(run())
     await audit_log(admin, "send_announcement", "email", req.subject[:80], {"queued": len(targets), "skipped": len(already)})
-    return {"success": True, "sent": len(targets), "queued": len(targets), "skipped_already_received": sum(1 for c in candidates if c.get("email")) - len(targets)}
+    return {"success": True, "queued": len(targets), "skipped_already_received": sum(1 for c in candidates if c.get("email")) - len(targets)}
 
 
 @api.post("/admin/emails/retry-failed")
@@ -1459,7 +1459,7 @@ async def cron_email_retry(request: Request, authorization: Optional[str] = Head
         raise HTTPException(status_code=401, detail="Unauthorized")
     cutoff = (now_utc() - timedelta(minutes=10)).isoformat()
     failed = await db.email_logs.find({"delivery_status": "failed", "retry_html": {"$exists": True},
-                                       "retry_count": {"$not": {"$gte": 3}}, "date_sent": {"$lte": cutoff}},
+                                       "retry_count": {"$not": {"$gte": 2}}, "date_sent": {"$lte": cutoff}},
                                       {"_id": 0}).sort("date_sent", 1).to_list(EMAIL_RETRY_BATCH)
     ids = [f["email_id"] for f in failed]
     await db.email_logs.update_many({"email_id": {"$in": ids}}, {"$set": {"delivery_status": "retried"}, "$unset": {"retry_html": ""}})

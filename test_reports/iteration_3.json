@@ -1,0 +1,48 @@
+{
+  "summary": "Tested the DEFAULT JOB ALERTS feature and the email background/cron fix, backend and frontend. Backend: the new tests/test_job_alerts.py passes 15/15. The full /app/backend/tests suite (PACE_N=3) passes 83/83 after 4 outdated assertions were updated to the new semantics. Verified: (1) Consent has three states. A registered user with no preference has no job_alert_consent field. Saving the profile without touching alerts keeps it missing, in both the API and the UI (checked in Mongo; no consent_records doc is written). sp-alert-off then sp-save stores false and writes a consent_records doc. No candidate has an implicit false without a consent_records entry. (2) Share rules. A no-preference user gets in-app 'sent' and email 'skipped' with an opt-in reason. An opted-in user gets in-app sent plus one logged email attempt. An opted-out user is skipped ('candidate opted out of job alerts') and has no job_notifications. A low-relevance match (score 10) is skipped ('low relevance (score 10 < 50)'). An unapproved match is skipped. A second share is skipped as 'already sent'. Opting out after a share hides the notifications. (3) /smartmatch/notifications and /smartmatch/me: the shared item shows for no-preference users and is empty for opted-out users. (4) Alert Manager APIs: jobs (notified/approved counts), recipients, received=yes/no filters and the alert_pref/profile filters all work. Candidates get 403, unauthenticated requests get 401. (5) The sma-alert-prefs analytics match DB counts in both the API and the UI. (6) Register returns in under 5s with the welcome email in the background. Cron /api/cron/email-retry returns 401 for a bad or missing token and 200 {accepted, queued<=8} with the secret. UI, end to end: the Alert Manager sidebar nav, the job select, Find Matching Candidates and all 6 recipient filters return correct sets (opted_out lists only the opted-out user). Approve, then Send alert (in-app is the default, email unchecked) gives 'sent (in_app)'. The received view shows Delivered/Unread, then Read after the candidate clicks. The candidate dashboard-notifications card shows '1 new'; clicking it goes to the job. /matches shows the Shared tab and Recommended containing the job, plus the notice text. The opted-out candidate sees the 'You turned off job alerts' messages and Shared (0). SmartMatch Control Room, Match Review and Alerts & Templates pages load. The email provider was quota-limited (429) for the whole run, so welcome, announcement and retry emails were logged as failed-with-retry_html, which is expected.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/cron/email-retry", "issue": "The filter is retry_count {$not:{$gte:3}}. A failed log with retry_count 0/1/2 is re-sent, so one email can be sent up to 4 times in total (the original plus 3 retries). If 'max 3 attempts' means 3 total sends, use $lt 2, or count the original send."},
+      {"endpoint": "POST /api/admin/announcement", "issue": "The response field 'sent' equals 'queued' even though nothing has been sent yet (the work is in the background). This is misleading; consider dropping 'sent' or renaming it."},
+      {"endpoint": "GET /api/admin/smartmatch/analytics alert_prefs.notifications_sent", "issue": "This counts sent + failed (attempted), but the label says 'Notifications sent'. Consider renaming it to 'Notifications attempted'."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "AlertManager recipient filter 'Opted out (view only)'", "issue": "Rows still show Approve / Reject / Mark pending review / Comment actions, so the view is not actually read-only. Share is skipped by the backend, but approve is allowed. Hide the row actions and bulk buttons when rf === 'opted_out'.", "selector": "[data-testid='am-rf-opted_out'] -> [data-testid^='approve-']", "priority": "LOW"},
+      {"component": "AlertManager job summary", "issue": "The 'N matched · N approved · N received in-app' line and the dropdown counts do not refresh after approve or share in the MatchTable (the am-jobs query is not invalidated). They stay at 0 approved / 0 received until a reload.", "selector": "[data-testid='am-job-picker']", "priority": "LOW"}
+    ],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "SmartMatch Analytics", "issues": ["From/To filters still use the browser's native date input instead of the shadcn calendar (carried over from the earlier report)."]}
+    ]
+  },
+  "test_report_links": ["/app/backend/tests/test_job_alerts.py", "/app/backend/tests/ui_setup_alerts.py", "/app/test_reports/pytest/pytest_results_iter3.xml"],
+  "action_items": [
+    "Make the Alert Manager 'Opted out (view only)' filter actually read-only (hide approve/reject/share actions and bulk buttons)",
+    "Invalidate the ['am-jobs'] query after review/share in the Alert Manager (or pass an onChange callback into MatchTable)",
+    "Clarify the max-attempts semantics in cron_email_retry (currently up to 1 original + 3 retries)",
+    "tests/test_jobradar_api.py and tests/test_tracker_demand.py leave TEST users behind (test_<hex>@example.com, test_trk_<hex>@example.com). Add teardown cleanup.",
+    "tests/test_email_pacing.py sends a TEST_ announcement to ALL candidates, including the seeded test@jobradar.com. Consider scoping the announcement endpoint or the test to TEST recipients only."
+  ],
+  "critical_code_review_comments": [
+    "smartmatch.py is 1071 lines and server.py is 1850 lines, above the 700-line guideline; split alert-manager/notifications and the email/cron code into modules",
+    "match_query alert_pref/profile filters load all candidates (to_list(50000)) and filter in Python. That is fine at this size but will not scale; for alert_pref, push the tri-state into a Mongo query ($exists/$eq).",
+    "The analytics endpoint also loads all users, matches and notifications into memory",
+    "/auth/profile cannot reset consent to 'no preference' (None is filtered out). That is consistent with the spec (only on/off are offered), but noted."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_job_alerts.py (new)",
+    "/app/backend/tests/ui_setup_alerts.py (new UI seed helper)",
+    "/app/backend/tests/test_smartmatch.py (skip reason now 'opted out' because register-with-false means explicit opt-out)",
+    "/app/backend/tests/test_email_pacing.py (poll for background welcome logs; accept failed-with-retry under provider quota; dedupe count includes failed-with-retry)"
+  ],
+  "success_rate": {"backend": "100% (83/83 after updating 4 outdated assertions; 15/15 new job-alert tests)", "frontend": "95% (all flows work; 2 low-priority UI issues)"},
+  "test_credentials": "admin@eevolvex.com / Admin@12345; test@jobradar.com / Test@12345 (only touched indirectly by the existing pacing test's announcement and a login in test_candidate_forbidden; consent still true)",
+  "seed_data_creation": "Created TEST_JA_*/TEST_UI_* users, jobs and related docs, plus TEST pace users. All were removed by id/email afterwards, along with leftover users test_44b64851@example.com and test_trk_c31d168b@example.com (from existing suites), email_logs with TEST_ subjects (25) and @example.com addresses (43). app_settings launch_offer.granted was reset to 1 (the count of users with launch_offer 'granted'). Remaining users: admin, test@jobradar.com, saurabhsaluja30@gmail.com (untouched).",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Run the tests with `-n 0` (xdist is configured in pytest.ini) and PACE_N=3. test_job_alerts.py cleans up after itself. The email provider is quota-limited (~10/window), so expect 'failed' plus retry_html on email logs. Candidate login is /auth/login, admin login is /admin. Alert Manager is /admin/alert-manager (nav testid 'admin-nav-Job Alert Manager'). Match row testid is match-row-<id>, share dialog channels are share-channel-in_app/email, results are in share-results. Use tests/ui_setup_alerts.py <tag> to seed a verified job plus 2 TEST candidates for UI tests (the password is Test@123), then clean up by id.",
+  "rca of the issue": "No blocking bugs. Four regression failures came from outdated test expectations, not app bugs: (a) the opted-out reason text changed; (b) welcome email is now in the background, so the log appears later; (c) dedupe now counts failed-with-retry recipients; (d) the provider returns 429, so 'all sent' is impossible. The tests were updated."
+}

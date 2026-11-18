@@ -469,7 +469,7 @@ export function AlertManager() {
                 <Chips label="Recipients" value={rf} options={RECIPIENT_FILTERS.map((x) => x[0])} short={(o) => (o === "All" ? "Everyone" : RECIPIENT_FILTERS.find((x) => x[0] === o)?.[1])} onChange={setRf} testId="am-rf" />
                 <Chips label="Review status" value={status} options={Object.keys(MATCH_STATUS_LABEL)} short={(o) => MATCH_STATUS_LABEL[o] || o} onChange={setStatus} testId="am-status" />
               </Card>
-              <MatchTable filters={filters} mode="job" title="Suggested candidates" defaultChannels={["in_app"]} />
+              <MatchTable filters={filters} mode="job" title="Suggested candidates" defaultChannels={["in_app"]} readOnly={rf === "opted_out"} />
             </>
           ) : (
             <Card className="overflow-x-auto p-0" data-testid="am-received">

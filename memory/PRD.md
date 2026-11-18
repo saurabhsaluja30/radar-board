@@ -20,6 +20,8 @@ Web version of the user's RADAR mobile app (github.com/saurabhsaluja30/radar-pre
   - Jobs: verification status, source tracking, exp/salary ranges, expiry auto-sweep, duplicate detection; Published shown as Open, Unpublished as Paused, Closed added.
   - Rule-based engine (smartmatch.py), Control Room, Find Matching Candidates/Jobs, Match Review with audit trail, alerts (in-app + email) with dedupe/consent/frequency, candidate My Job Matches (/matches), SmartMatch analytics.
 
+- 2026-06: Default job alerts: tri-state consent (on / not selected = in-app only / opted out), Job Alert Manager (/admin/alert-manager), dashboard job notifications, alert-preference analytics. Email: paced sender, background welcome email, 15-min retry cron (.emergent/crons.yml email-retry).
+
 ## Backlog
 - P1: Real payment gateway (checkout is DEMO).
 - P1: WhatsApp alerts (needs approved WhatsApp Business provider).

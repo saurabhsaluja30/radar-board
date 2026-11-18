@@ -167,7 +167,7 @@ class TestSmartMatchFlow:
         assert any(x["channel"] == "in_app" and x["result"] == "sent" for x in a_res), res
         assert any(x["channel"] == "email" and x["result"] in ("sent", "failed") for x in a_res), res
         b_res = [x for x in res if x["match_id"] == mb]
-        assert b_res[0]["result"] == "skipped" and "consent" in b_res[0]["reason"]
+        assert b_res[0]["result"] == "skipped" and "opted out" in b_res[0]["reason"]
         assert self._match(admin, job, cands[0][1])["status"] == "shared"
         r2 = admin.post(f"{API}/admin/smartmatch/matches/share", json={"match_ids": [ma], "channels": ["in_app"]}).json()["results"]
         assert r2[0]["result"] == "skipped" and r2[0]["reason"] == "already sent"
