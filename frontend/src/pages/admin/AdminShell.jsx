@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { BarChart3, Briefcase, ClipboardCheck, Crosshair, Megaphone, Radar, CreditCard, FlaskConical, Gift, LayoutDashboard, LogOut, Mail, PieChart, Receipt, ShieldCheck, Sparkles, Trophy, UserPlus, Users } from "lucide-react";
+import { BarChart3, BellRing, Briefcase, ClipboardCheck, Crosshair, Megaphone, Radar, CreditCard, FlaskConical, Gift, LayoutDashboard, LogOut, Mail, PieChart, Receipt, ShieldCheck, Sparkles, Trophy, UserPlus, Users } from "lucide-react";
 import { RegistrationStats } from "@/pages/admin/AdminAnalytics";
 import { api } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
@@ -16,6 +16,7 @@ const GROUPS = [
   ["Subscription and Payment Management", [{ icon: CreditCard, label: "Subscriptions", to: "/admin/subscriptions" }, { icon: Receipt, label: "Payments", to: "/admin/payments" }]],
   ["JobRadar SmartMatch", [
     { icon: Radar, label: "SmartMatch Control Room", to: "/admin/smartmatch", end: true },
+    { icon: BellRing, label: "Job Alert Manager", to: "/admin/alert-manager" },
     { icon: ClipboardCheck, label: "Match Review", to: "/admin/smartmatch/review" },
     { icon: Crosshair, label: "Find Matching Jobs", to: "/admin/smartmatch/candidates" },
     { icon: Megaphone, label: "Alerts & Templates", to: "/admin/smartmatch/alerts" },

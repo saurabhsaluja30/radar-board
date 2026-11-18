@@ -7,7 +7,7 @@ import { useAuth } from "@/context/AuthContext";
 import { formatDate, scoreColor } from "@/lib/constants";
 import { Badge, Button, Card, Chip, EmptyState, errMsg, notify, PageHeader, Spinner } from "@/components/kit";
 import { Page } from "@/components/Layout";
-import { ProfileCompletion } from "@/components/SmartProfile";
+import { ALERT_NOTICE, ProfileCompletion } from "@/components/SmartProfile";
 
 const expText = (j) => (j.experience_min != null && j.experience_max != null ? `${j.experience_min}–${j.experience_max} yrs` : j.experience_required || "Experience not specified");
 
@@ -98,9 +98,10 @@ export default function Matches() {
               {TABS.map(([k, l]) => (
                 <Chip key={k} label={`${l} (${(data[k] || []).length})${k === "shared" && data.unread ? ` · ${data.unread} new` : ""}`} selected={tab === k} onClick={() => setTab(k)} data-testid={`matches-tab-${k}`} />
               ))}
-              {!data.alerts.consent ? (
-                <p className="w-full text-xs text-gray-500">Job alerts are off. <button className="font-bold text-brand underline" onClick={() => navigate("/profile")} data-testid="matches-enable-alerts">Turn on alerts</button> to receive opportunities JobRadar approves for you.</p>
-              ) : null}
+              <p className="w-full text-xs text-gray-500" data-testid="matches-alert-notice">
+                {data.alerts.pref === "opted_out" ? "You turned off job alerts, so JobRadar won't send you opportunities. Your matches below are still based on your profile. " : `${ALERT_NOTICE} `}
+                <button className="font-bold text-brand underline" onClick={() => navigate("/profile")} data-testid="matches-alert-settings">Notification preferences</button>
+              </p>
             </div>
             <ProfileCompletion compact />
           </div>

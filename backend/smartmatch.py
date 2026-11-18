@@ -66,6 +66,15 @@ PROFILE_FIELDS = [
 ]
 
 
+MIN_RELEVANCE = 50
+ALERT_PREF_LABEL = {"enabled": "Job alerts on", "none": "No preference selected", "opted_out": "Opted out"}
+
+
+def alert_pref(c: dict) -> str:
+    v = c.get("job_alert_consent")
+    return "enabled" if v is True else "opted_out" if v is False else "none"
+
+
 def split_list(v) -> List[str]:
     if isinstance(v, list):
         items = v
@@ -395,7 +404,8 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
                 "preferred_country": c.get("preferred_country"), "notice_period": c.get("notice_period"),
                 "industry": c.get("industry"), "preferred_industries": c.get("preferred_industries") or [],
                 "preferred_work_mode": c.get("preferred_work_mode"), "profile_status": c.get("profile_status") or "Active",
-                "job_alert_consent": bool(c.get("job_alert_consent")), "suspended": bool(c.get("suspended")),
+                "job_alert_consent": c.get("job_alert_consent") is True, "alert_pref": alert_pref(c),
+                "suspended": bool(c.get("suspended")),
                 **profile_status(c)}
 
     # ------------------------------------------------------------------ admin: jobs
@@ -523,9 +533,31 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
             cf["total_experience"] = er
         if f.get("max_ctc") not in (None, ""):
             cf["expected_ctc"] = {"$lte": float(f["max_ctc"])}
+        ids = None
         if cf:
             cf["role"] = "candidate"
             ids = set(await db.users.distinct("user_id", cf))
+        ap, prof = f.get("alert_pref"), f.get("profile")
+        if (ap and ap != "All") or (prof and prof != "All"):
+            people = await db.users.find({"role": "candidate"}, {"_id": 0, "password": 0}).to_list(50000)
+            keep = set()
+            for u in people:
+                p = alert_pref(u)
+                if ap == "eligible" and (p == "opted_out" or u.get("suspended") or u.get("profile_status") == "Inactive"):
+                    continue
+                if ap in ALERT_PREF_LABEL and p != ap:
+                    continue
+                if prof in ("complete", "incomplete") and (profile_status(u)["completion"] == 100) != (prof == "complete"):
+                    continue
+                keep.add(u["user_id"])
+            ids = keep if ids is None else ids & keep
+        if f.get("received") in ("yes", "no") and f.get("job_id"):
+            got = set(await db.job_notifications.distinct("candidate_id", {"job_id": f["job_id"], "status": "sent"}))
+            if f["received"] == "yes":
+                ids = got if ids is None else ids & got
+            else:
+                q.setdefault("$and", []).append({"candidate_id": {"$nin": list(got)}})
+        if ids is not None:
             q["candidate_id"] = {"$in": list(ids & {f["candidate_id"]} if f.get("candidate_id") else ids)}
         return q
 
@@ -544,12 +576,13 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
                         "job_eligible": not job_ineligible_reason(j) if j else False})
         return out
 
-    FILTER_KEYS = ["job_id", "candidate_id", "status", "min_score", "max_score", "industry", "source", "location", "company",
+    FILTER_KEYS = ["alert_pref", "profile", "received", "job_id", "candidate_id", "status", "min_score", "max_score", "industry", "source", "location", "company",
                    "job_title", "job_status", "work_mode", "country", "designation", "skills", "notice_period",
                    "candidate_status", "min_exp", "max_exp", "max_ctc"]
 
     @r.get("/admin/smartmatch/matches")
-    async def list_matches(admin=Depends(require_admin), page: int = 1, page_size: int = 25, job_id: str = "", candidate_id: str = "",
+    async def list_matches(admin=Depends(require_admin), page: int = 1, page_size: int = 25, alert_pref: str = "", profile: str = "",
+                           received: str = "", job_id: str = "", candidate_id: str = "",
                            status: str = "", min_score: str = "", max_score: str = "", industry: str = "", source: str = "",
                            location: str = "", company: str = "", job_title: str = "", job_status: str = "", work_mode: str = "",
                            country: str = "", designation: str = "", skills: str = "", notice_period: str = "",
@@ -566,7 +599,8 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
         return {"matches": await enrich(items), "total": total, "page": page, "page_size": page_size}
 
     @r.get("/admin/smartmatch/matches/export")
-    async def export_matches(admin=Depends(require_admin), job_id: str = "", candidate_id: str = "", status: str = "",
+    async def export_matches(admin=Depends(require_admin), alert_pref: str = "", profile: str = "", received: str = "",
+                             job_id: str = "", candidate_id: str = "", status: str = "",
                              min_score: str = "", max_score: str = "", industry: str = "", source: str = "", location: str = "",
                              company: str = "", job_title: str = "", job_status: str = "", work_mode: str = "", country: str = "",
                              designation: str = "", skills: str = "", notice_period: str = "", candidate_status: str = "",
@@ -708,11 +742,19 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
             if not c or c.get("suspended") or c.get("profile_status") == "Inactive":
                 results.append({"match_id": mid, "result": "skipped", "reason": "candidate inactive"})
                 continue
-            if not c.get("job_alert_consent"):
-                results.append({"match_id": mid, "result": "skipped", "reason": "candidate has not consented to job alerts"})
+            pref = alert_pref(c)
+            if pref == "opted_out":
+                results.append({"match_id": mid, "result": "skipped", "reason": "candidate opted out of job alerts"})
+                continue
+            if m["match_score"] < MIN_RELEVANCE:
+                results.append({"match_id": mid, "result": "skipped", "reason": f"low relevance (score {m['match_score']} < {MIN_RELEVANCE})"})
                 continue
             any_sent = False
             for ch in channels:
+                if ch == "email" and pref != "enabled":
+                    results.append({"match_id": mid, "channel": ch, "result": "skipped",
+                                    "reason": "email needs the candidate's opt-in — no preference selected, in-app only"})
+                    continue
                 prev = await db.job_notifications.find_one({"candidate_id": c["user_id"], "job_id": j["job_id"], "channel": ch}, {"_id": 0})
                 if prev and prev["status"] == "sent":
                     results.append({"match_id": mid, "channel": ch, "result": "skipped", "reason": "already sent"})
@@ -879,6 +921,13 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
                  "explain": "Applied matches that reported an interview ÷ applied matches"},
                 {"label": "Employer Revenue", "value": None, "explain": "Not tracked yet — JobRadar has no employer billing"},
             ],
+            "alert_prefs": {
+                "active_candidates": sum(1 for u in users if not u.get("suspended") and u.get("profile_status") != "Inactive"),
+                "enabled": sum(1 for u in users if alert_pref(u) == "enabled"), "none": sum(1 for u in users if alert_pref(u) == "none"),
+                "opted_out": sum(1 for u in users if alert_pref(u) == "opted_out"),
+                "eligible_in_app": sum(1 for u in users if alert_pref(u) != "opted_out" and not u.get("suspended") and u.get("profile_status") != "Inactive"),
+                "notifications_sent": len(attempted), "notifications_delivered": len(sent),
+                "notifications_failed": sum(1 for n in notes if n["status"] == "failed"), "candidate_responses": len(responded)},
             "alerts": {"sent": len(sent), "failed": sum(1 for n in notes if n["status"] == "failed"),
                        "email_sent": sum(1 for n in sent if n["channel"] == "email"), "in_app_sent": sum(1 for n in sent if n["channel"] == "in_app")},
         }
@@ -921,6 +970,39 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
         if m and m["status"] in ("shared", "interested", "not_interested"):
             await set_match_status(m, req.response, None)
         return {"ok": True}
+
+    @r.get("/smartmatch/notifications")
+    async def my_notifications(user=Depends(get_current_user)):
+        if alert_pref(user) == "opted_out":
+            return {"notifications": [], "unread": 0, "pref": "opted_out"}
+        notes = await db.job_notifications.find({"candidate_id": user["user_id"], "channel": "in_app", "status": "sent"},
+                                                {"_id": 0, "notification_id": 1, "job_id": 1, "subject": 1, "sent_at": 1, "read_at": 1}).sort("sent_at", -1).to_list(30)
+        jobs = {j["job_id"]: j for j in await db.jobs.find({"job_id": {"$in": [n["job_id"] for n in notes]}},
+                                                           {"_id": 0, "job_id": 1, "title": 1, "company": 1, "status": 1}).to_list(50)}
+        out = [{**n, "title": jobs.get(n["job_id"], {}).get("title"), "company": jobs.get(n["job_id"], {}).get("company")} for n in notes if n["job_id"] in jobs]
+        return {"notifications": out, "unread": sum(1 for n in out if not n.get("read_at")), "pref": alert_pref(user)}
+
+    @r.get("/admin/alert-manager/jobs")
+    async def am_jobs(admin=Depends(require_admin)):
+        await sweep_expired()
+        jobs = await db.jobs.find(eligible_q(), {"_id": 0, "job_id": 1, "title": 1, "company": 1, "location": 1, "city": 1,
+                                                 "date_published": 1, "date_added": 1}).sort("date_added", -1).to_list(2000)
+        ids = [j["job_id"] for j in jobs]
+        mc = {d["_id"]: d for d in await db.job_matches.aggregate([{"$match": {"job_id": {"$in": ids}}}, {"$group": {
+            "_id": "$job_id", "matches": {"$sum": 1},
+            "approved": {"$sum": {"$cond": [{"$in": ["$status", ["approved", "shared", "interested", "applied", "interview_reported"]]}, 1, 0]}}}}]).to_list(5000)}
+        nc = {d["_id"]: d["n"] for d in await db.job_notifications.aggregate([{"$match": {"job_id": {"$in": ids}, "status": "sent", "channel": "in_app"}},
+                                                                              {"$group": {"_id": "$job_id", "n": {"$sum": 1}}}]).to_list(5000)}
+        return {"jobs": [{**j, "matches": mc.get(j["job_id"], {}).get("matches", 0), "approved": mc.get(j["job_id"], {}).get("approved", 0),
+                          "notified": nc.get(j["job_id"], 0)} for j in jobs]}
+
+    @r.get("/admin/alert-manager/jobs/{job_id}/recipients")
+    async def am_recipients(job_id: str, admin=Depends(require_admin)):
+        notes = await db.job_notifications.find({"job_id": job_id}, {"_id": 0, "body": 0}).sort("updated_at", -1).to_list(5000)
+        users = {u["user_id"]: u for u in await db.users.find({"user_id": {"$in": [n["candidate_id"] for n in notes]}},
+                                                             {"_id": 0, "user_id": 1, "full_name": 1, "email": 1}).to_list(5000)}
+        return {"recipients": [{**n, "candidate_name": users.get(n["candidate_id"], {}).get("full_name"),
+                                "candidate_email": users.get(n["candidate_id"], {}).get("email")} for n in notes]}
 
     @r.post("/smartmatch/notifications/{notification_id}/read")
     async def read_note(notification_id: str, user=Depends(get_current_user)):
@@ -970,14 +1052,15 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
             if a["job_id"] not in seen:
                 seen.add(a["job_id"])
                 viewed_ids.append(a["job_id"])
-        notes = await db.job_notifications.find({"candidate_id": uid, "channel": "in_app", "status": "sent"}, {"_id": 0}).sort("sent_at", -1).to_list(100)
+        notes = [] if alert_pref(user) == "opted_out" else await db.job_notifications.find(
+            {"candidate_id": uid, "channel": "in_app", "status": "sent"}, {"_id": 0}).sort("sent_at", -1).to_list(100)
         shared = []
         for n in notes:
             c = cards.get(n["job_id"])
             if c:
                 shared.append({**c, "notification": {k: n.get(k) for k in ("notification_id", "subject", "body", "sent_at", "read_at")}})
         return {
-            "profile": profile_status(user), "alerts": {"consent": bool(user.get("job_alert_consent")), "frequency": user.get("job_alert_frequency") or "Instant"},
+            "profile": profile_status(user), "alerts": {"consent": user.get("job_alert_consent") is True, "pref": alert_pref(user), "frequency": user.get("job_alert_frequency") or "Instant"},
             "recommended": [c for c in ranked if c["match"]["match_score"] >= 65][:12],
             "strong": [c for c in ranked if c["match"]["match_score"] >= 80][:12],
             "recent": recent[:12], "saved": [cards[i] for i in saved_ids if i in cards],

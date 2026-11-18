@@ -11,7 +11,7 @@ import JobDetail from "@/pages/JobDetail";
 import Saved from "@/pages/Saved";
 import Tracker from "@/pages/Tracker";
 import Matches from "@/pages/Matches";
-import { SmartMatchAlerts, SmartMatchAnalytics, SmartMatchCandidate, SmartMatchCandidates, SmartMatchHome, SmartMatchJob, SmartMatchReview } from "@/pages/admin/AdminSmartMatch";
+import { AlertManager, SmartMatchAlerts, SmartMatchAnalytics, SmartMatchCandidate, SmartMatchCandidates, SmartMatchHome, SmartMatchJob, SmartMatchReview } from "@/pages/admin/AdminSmartMatch";
 import { Forgot, Login, Register } from "@/pages/Auth";
 import { Account, Dashboard, Membership, Plans, Profile } from "@/pages/Member";
 import { About, Contact, FAQ, Legal } from "@/pages/Info";
@@ -92,6 +92,7 @@ export default function App() {
               <Route path="demand" element={<AdminDemand />} />
               <Route path="success" element={<AdminSuccess />} />
               <Route path="smartmatch" element={<SmartMatchHome />} />
+              <Route path="alert-manager" element={<AlertManager />} />
               <Route path="smartmatch/job/:id" element={<SmartMatchJob />} />
               <Route path="smartmatch/candidates" element={<SmartMatchCandidates />} />
               <Route path="smartmatch/candidate/:id" element={<SmartMatchCandidate />} />

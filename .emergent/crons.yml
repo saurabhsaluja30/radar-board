@@ -7,3 +7,11 @@ crons:
     endpoint: "{{BASE_URL}}/api/cron/tracker-reminders"
     method: POST
     enabled: true
+  - name: email-retry
+    description: "Every 15 minutes, re-send up to 8 emails that failed (e.g. provider rate limit), max 3 attempts each"
+    cron: "*/15 * * * *"
+    timezone: "Asia/Kolkata"
+    # Cron endpoints must ack 2xx immediately; enqueue/background the actual work.
+    endpoint: "{{BASE_URL}}/api/cron/email-retry"
+    method: POST
+    enabled: true

@@ -10,7 +10,7 @@ import { LaunchOfferCard, MembershipCard, OpportunityNotice, useLaunchOffer } fr
 import { JobCard } from "@/components/JobCard";
 import { CareerToolsCards } from "@/components/career";
 import { Page } from "@/components/Layout";
-import { ProfileCompletion, SmartProfileForm } from "@/components/SmartProfile";
+import { ALERT_NOTICE, ProfileCompletion, SmartProfileForm } from "@/components/SmartProfile";
 import { GoogleButton, OrLine } from "@/pages/Auth";
 
 function LoginPrompt({ title, text }) {
@@ -298,6 +298,7 @@ export function Dashboard() {
       <PageHeader title={`Welcome, ${(user.full_name || "there").split(" ")[0]}`} subtitle="Here is your JobRadar snapshot." />
       <div className="grid gap-8 lg:grid-cols-[1fr_380px]">
         <div className="min-w-0 space-y-12">
+          <JobNotifications />
           <ProfileCompletion compact />
           <Card className="flex flex-wrap items-center gap-4" data-testid="dashboard-matches">
             <div className="flex-1"><p className="h-sec">My Job Matches</p><p className="muted mt-1">Jobs ranked by how well they fit your profile, plus opportunities JobRadar shares with you.</p></div>
@@ -334,6 +335,35 @@ export function Dashboard() {
         </aside>
       </div>
     </Page>
+  );
+}
+
+function JobNotifications() {
+  const navigate = useNavigate();
+  const { user } = useAuth();
+  const { data, refetch } = useQuery({ queryKey: ["my-notifications", user?.user_id], queryFn: () => api("/smartmatch/notifications"), enabled: user?.role === "candidate" });
+  if (!data) return null;
+  const open = async (n) => {
+    if (!n.read_at) await api(`/smartmatch/notifications/${n.notification_id}/read`, { method: "POST" }).catch(() => {});
+    refetch();
+    navigate(`/job/${n.job_id}`);
+  };
+  return (
+    <Card className="space-y-3" data-testid="dashboard-notifications">
+      <div className="flex items-center justify-between gap-3">
+        <p className="h-sec">Job notifications {data.unread ? <span className="ml-1 rounded-full bg-brand px-2 py-0.5 text-xs text-white" data-testid="notifications-unread">{data.unread} new</span> : null}</p>
+        <button onClick={() => navigate("/matches")} className="text-sm font-bold text-brand hover:underline" data-testid="notifications-all">All matches</button>
+      </div>
+      {data.pref === "opted_out" ? <p className="muted">You turned off job alerts. Turn them back on in your profile anytime.</p>
+        : data.notifications.length === 0 ? <p className="muted">No new opportunities yet. When JobRadar finds a relevant job for you, it will appear here.</p>
+        : data.notifications.slice(0, 5).map((n) => (
+          <button key={n.notification_id} onClick={() => open(n)} className="flex w-full items-center justify-between gap-3 rounded-xl border border-gray-100 p-3 text-left hover:border-brand" data-testid={`notification-${n.notification_id}`}>
+            <span><span className="block font-bold">{n.title}</span><span className="text-xs text-gray-500">{n.company} · {formatDate(n.sent_at)}</span></span>
+            {!n.read_at ? <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-brand" /> : null}
+          </button>
+        ))}
+      <p className="text-[11px] text-gray-400">{ALERT_NOTICE}</p>
+    </Card>
   );
 }
 

@@ -1,3 +1,4 @@
+import hmac
 import asyncio
 import os
 import re
@@ -13,7 +14,7 @@ from typing import List, Optional
 
 import bcrypt
 import httpx
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, Query
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, Query, Request
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -130,7 +131,8 @@ def _wrap_email(title: str, inner: str) -> str:
     )
 
 
-async def send_and_log_email(*, candidate_id: Optional[str], to: str, email_type: str, subject: str, html: str):
+async def send_and_log_email(*, candidate_id: Optional[str], to: str, email_type: str, subject: str, html: str,
+                             retry_count: int = 0):
     """Log every email, attempt real send via Resend, never raise to the caller."""
     log = {
         "email_id": f"email_{uuid.uuid4().hex[:12]}",
@@ -162,12 +164,14 @@ async def send_and_log_email(*, candidate_id: Optional[str], to: str, email_type
         log["error_message"] = str(e)[:200]
     if log["delivery_status"] == "failed":
         log["retry_html"] = html
+        log["retry_count"] = retry_count
     await db.email_logs.insert_one(dict(log))
     log.pop("retry_html", None)
     return log
 
 
 _bg_tasks: set = set()
+_announce_inflight: dict = {}
 
 
 def _bg(coro):
@@ -184,7 +188,7 @@ EMAIL_MIN_GAP = 0.6
 async def _paced_send(to: str, subject: str, html: str):
     """Serialise sends with a minimum gap and back off on 429 so bulk sends stay under the provider limit."""
     resp = None
-    for attempt in range(5):
+    for attempt in range(2):
         async with _email_lock:
             wait = EMAIL_MIN_GAP - (asyncio.get_event_loop().time() - _email_last["t"])
             if wait > 0:
@@ -199,7 +203,8 @@ async def _paced_send(to: str, subject: str, html: str):
             delay = float(resp.headers.get("retry-after") or 0)
         except ValueError:
             delay = 0
-        await asyncio.sleep(max(delay, 2 ** attempt))
+        if attempt == 0:
+            await asyncio.sleep(min(max(delay, 3), 10))
     return resp
 
 
@@ -597,8 +602,8 @@ async def register(req: RegisterReq):
     token = await create_session(user_id)
     inner = (f'<p style="color:#374151;font-size:15px">Hi {escape(req.full_name)},</p>'
              f'<p style="color:#374151;font-size:15px">Welcome to JobRadar by Evolveminds! {_welcome_line(offer)}</p>')
-    await send_and_log_email(candidate_id=user_id, to=req.email.lower(), email_type="welcome",
-                             subject="Welcome to JobRadar by Evolveminds", html=_wrap_email("Welcome aboard!", inner))
+    _bg(send_and_log_email(candidate_id=user_id, to=req.email.lower(), email_type="welcome",
+                           subject="Welcome to JobRadar by Evolveminds", html=_wrap_email("Welcome aboard!", inner)))
     user = await db.users.find_one({"user_id": user_id}, {"_id": 0, "password": 0})
     return {"token": token, "user": user}
 
@@ -653,9 +658,9 @@ async def google_session(req: SessionReq):
         offer = await _apply_launch_offer(user_id)
         inner = (f'<p style="color:#374151;font-size:15px">Hi {escape(data.get("name") or "there")},</p>'
                  f'<p style="color:#374151;font-size:15px">Welcome to JobRadar by Evolveminds! {_welcome_line(offer)}</p>')
-        await send_and_log_email(candidate_id=user_id, to=email, email_type="welcome",
-                                 subject="Welcome to JobRadar by Evolveminds",
-                                 html=_wrap_email("Welcome aboard!", inner))
+        _bg(send_and_log_email(candidate_id=user_id, to=email, email_type="welcome",
+                               subject="Welcome to JobRadar by Evolveminds",
+                               html=_wrap_email("Welcome aboard!", inner)))
     token = await create_session(user_id)
     user = await db.users.find_one({"user_id": user_id}, {"_id": 0, "password": 0})
     return {"session_token": token, "token": token, "user": user}
@@ -734,7 +739,7 @@ async def update_profile(req: ProfileReq, user=Depends(get_current_user)):
     for k in ("primary_skills", "secondary_skills", "preferred_titles", "preferred_locations"):
         if k in updates:
             updates[k] = list(dict.fromkeys(x.strip()[:80] for x in updates[k] if x and x.strip()))[:30]
-    if "job_alert_consent" in updates and bool(user.get("job_alert_consent")) != updates["job_alert_consent"]:
+    if "job_alert_consent" in updates and user.get("job_alert_consent") is not updates["job_alert_consent"]:
         await db.consent_records.insert_one({"consent_id": f"cs_{uuid.uuid4().hex[:12]}", "user_id": user["user_id"],
                                              "type": "job_alerts", "granted": updates["job_alert_consent"],
                                              "source": "profile", "at": now_iso()})
@@ -1398,17 +1403,26 @@ async def admin_announcement(req: AnnouncementReq, admin=Depends(require_admin))
     inner = f'<p style="color:#374151;font-size:15px">{escape(req.message)}</p>'
     html = _wrap_email(req.subject, inner)
     already = set(await db.email_logs.distinct("candidate_id", {"email_type": "announcement", "subject": req.subject,
-                                                                "delivery_status": "sent"}))
+                                                                "$or": [{"delivery_status": "sent"},
+                                                                        {"delivery_status": "failed", "retry_html": {"$exists": True}}]}))
+    already |= set(_announce_inflight.get(req.subject, set()))
     targets = [c for c in candidates if c.get("email") and c["user_id"] not in already]
 
+    inflight = _announce_inflight.setdefault(req.subject, set())
+    inflight.update(c["user_id"] for c in targets)
+
     async def run():
-        for c in targets:
-            await send_and_log_email(candidate_id=c["user_id"], to=c["email"], email_type="announcement",
-                                     subject=req.subject, html=html)
+        try:
+            for c in targets:
+                await send_and_log_email(candidate_id=c["user_id"], to=c["email"], email_type="announcement",
+                                         subject=req.subject, html=html)
+                inflight.discard(c["user_id"])
+        finally:
+            inflight.difference_update(c["user_id"] for c in targets)
 
     _bg(run())
     await audit_log(admin, "send_announcement", "email", req.subject[:80], {"queued": len(targets), "skipped": len(already)})
-    return {"success": True, "sent": len(targets), "queued": len(targets), "skipped_already_received": len(already)}
+    return {"success": True, "sent": len(targets), "queued": len(targets), "skipped_already_received": sum(1 for c in candidates if c.get("email")) - len(targets)}
 
 
 @api.post("/admin/emails/retry-failed")
@@ -1418,14 +1432,39 @@ async def admin_retry_failed(admin=Depends(require_admin)):
     ids = [f["email_id"] for f in failed]
     await db.email_logs.update_many({"email_id": {"$in": ids}}, {"$set": {"delivery_status": "retried"}, "$unset": {"retry_html": ""}})
 
-    async def run():
-        for f in failed:
-            await send_and_log_email(candidate_id=f.get("candidate_id"), to=f["to"], email_type=f["email_type"],
-                                     subject=f["subject"], html=f["retry_html"])
-
-    _bg(run())
+    _bg(_resend(failed))
     await audit_log(admin, "retry_failed_emails", "email", "-", {"count": len(failed)})
     return {"queued": len(failed)}
+
+
+async def _resend(failed: list):
+    for f in failed:
+        if f.get("candidate_id"):
+            u = await db.users.find_one({"user_id": f["candidate_id"]}, {"_id": 0, "suspended": 1})
+            if not u or u.get("suspended"):
+                continue
+        await send_and_log_email(candidate_id=f.get("candidate_id"), to=f["to"], email_type=f["email_type"],
+                                 subject=f["subject"], html=f["retry_html"], retry_count=(f.get("retry_count") or 0) + 1)
+
+
+EMAIL_RETRY_BATCH = 8
+
+
+@api.post("/cron/email-retry")
+async def cron_email_retry(request: Request, authorization: Optional[str] = Header(None)):
+    # Cron endpoints must ack 2xx immediately; enqueue/background the actual work.
+    secret = os.environ.get("WEBHOOK_CRON_SECRET") or ""
+    token = authorization[7:] if authorization and authorization.startswith("Bearer ") else ""
+    if not secret or not hmac.compare_digest(token, secret):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    cutoff = (now_utc() - timedelta(minutes=10)).isoformat()
+    failed = await db.email_logs.find({"delivery_status": "failed", "retry_html": {"$exists": True},
+                                       "retry_count": {"$not": {"$gte": 3}}, "date_sent": {"$lte": cutoff}},
+                                      {"_id": 0}).sort("date_sent", 1).to_list(EMAIL_RETRY_BATCH)
+    ids = [f["email_id"] for f in failed]
+    await db.email_logs.update_many({"email_id": {"$in": ids}}, {"$set": {"delivery_status": "retried"}, "$unset": {"retry_html": ""}})
+    _bg(_resend(failed))
+    return {"accepted": True, "queued": len(failed)}
 
 
 @api.get("/admin/plans")
@@ -1768,6 +1807,10 @@ async def startup():
     await seed()
     await db.jobs.update_many({"verification_status": {"$exists": False}}, {"$set": {"verification_status": "Verified"}})
     await db.jobs.update_many({"job_source": {"$exists": False}}, {"$set": {"job_source": "Other authorised source"}})
+    # Undo implicit opt-outs saved by the old form (no explicit consent record) so a blank stays "not selected".
+    explicit = await db.consent_records.distinct("user_id", {"type": "job_alerts"})
+    await db.users.update_many({"role": "candidate", "job_alert_consent": False, "user_id": {"$nin": explicit}},
+                               {"$unset": {"job_alert_consent": ""}})
     await asyncio.to_thread(_warm_storage, logger)
     logger.info("JobRadar backend ready")
 

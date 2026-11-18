@@ -87,8 +87,8 @@ function ReasonModal({ title, needReason, onSubmit, onClose }) {
   );
 }
 
-function ShareModal({ ids, onClose, onDone }) {
-  const [channels, setChannels] = useState(["in_app", "email"]);
+function ShareModal({ ids, onClose, onDone, defaultChannels }) {
+  const [channels, setChannels] = useState(defaultChannels || ["in_app", "email"]);
   const [busy, setBusy] = useState(false);
   const [results, setResults] = useState(null);
   const toggle = (c) => setChannels((x) => (x.includes(c) ? x.filter((y) => y !== c) : [...x, c]));
@@ -107,7 +107,7 @@ function ShareModal({ ids, onClose, onDone }) {
   return (
     <Modal open onClose={onClose}>
       <p className="text-xl font-extrabold">Send job alert</p>
-      <p className="muted mt-1">{ids.length} approved match{ids.length === 1 ? "" : "es"}. Only consenting candidates receive alerts; duplicates are skipped automatically.</p>
+      <p className="muted mt-1">{ids.length} approved match{ids.length === 1 ? "" : "es"}. Opted-out candidates and low-relevance matches (score under 50) are skipped; email goes only to candidates who turned alerts on; duplicates are skipped automatically.</p>
       <div className="mt-4 space-y-2 text-sm">
         {[["in_app", "In-app notification"], ["email", "Email"]].map(([k, l]) => (
           <label key={k} className="flex items-center gap-3"><input type="checkbox" checked={channels.includes(k)} onChange={() => toggle(k)} className="h-4 w-4 accent-[#7C3AED]" data-testid={`share-channel-${k}`} />{l}</label>
@@ -127,7 +127,7 @@ function ShareModal({ ids, onClose, onDone }) {
   );
 }
 
-export function MatchTable({ filters, mode = "job", title }) {
+export function MatchTable({ filters, mode = "job", title, defaultChannels }) {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const [page, setPage] = useState(1);
@@ -190,6 +190,8 @@ export function MatchTable({ filters, mode = "job", title }) {
                   <button onClick={() => navigate(`/admin/smartmatch/candidate/${m.candidate_id}`)} className="text-left">
                     <p className="font-bold hover:text-brand">{c.full_name || "—"}</p>
                     <p className="text-xs text-gray-500">{m.candidate_id} · {c.current_designation || "No designation"}</p>
+                    <p className={`text-[11px] font-semibold ${c.alert_pref === "opted_out" ? "text-red-600" : c.alert_pref === "enabled" ? "text-emerald-700" : "text-gray-400"}`}>
+                      {{ enabled: "Job alerts on", none: "No preference (in-app only)", opted_out: "Opted out" }[c.alert_pref]} · {c.completion}% profile</p>
                   </button>
                 );
                 return (
@@ -244,7 +246,7 @@ export function MatchTable({ filters, mode = "job", title }) {
       ) : null}
       {dialog?.type === "reject" ? <ReasonModal title="Reject match" needReason onClose={() => setDialog(null)} onSubmit={(t) => review(dialog.ids, "reject", { rejection_reason: t })} /> : null}
       {dialog?.type === "comment" ? <ReasonModal title="Internal comment" onClose={() => setDialog(null)} onSubmit={(t) => review(dialog.ids, "comment", { comment: t })} /> : null}
-      {dialog?.type === "share" ? <ShareModal ids={dialog.ids} onClose={() => setDialog(null)} onDone={refresh} /> : null}
+      {dialog?.type === "share" ? <ShareModal ids={dialog.ids} defaultChannels={defaultChannels} onClose={() => setDialog(null)} onDone={refresh} /> : null}
       {dialog?.type === "history" ? <HistoryModal m={dialog.m} onClose={() => setDialog(null)} /> : null}
     </Card>
   );

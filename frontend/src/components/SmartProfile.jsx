@@ -6,6 +6,8 @@ import { useAuth } from "@/context/AuthContext";
 import { ALERT_FREQUENCIES, CURRENCIES, EMPLOYMENT_TYPES, NOTICE_PERIODS } from "@/lib/constants";
 import { Button, Card, Chip, ChipRow, errMsg, Input, notify, Switch } from "@/components/kit";
 
+export const ALERT_NOTICE = "JobRadar uses your profile to recommend relevant opportunities. You can change your notification preferences at any time.";
+
 const toList = (s) => s.split(",").map((x) => x.trim()).filter(Boolean);
 const fromList = (v) => (Array.isArray(v) ? v.join(", ") : v || "");
 
@@ -37,7 +39,7 @@ export function SmartProfileForm() {
     secondary_skills: fromList(user.secondary_skills), preferred_titles: fromList(user.preferred_titles || user.preferred_designation),
     preferred_locations: fromList(user.preferred_locations || user.preferred_location), preferred_country: user.preferred_country || "",
     notice_period: user.notice_period || "", willing_to_relocate: !!user.willing_to_relocate, employment_type_pref: user.employment_type_pref || "",
-    profile_status: user.profile_status || "Active", job_alert_consent: !!user.job_alert_consent, job_alert_frequency: user.job_alert_frequency || "Instant",
+    profile_status: user.profile_status || "Active", job_alert_consent: user.job_alert_consent ?? null, job_alert_frequency: user.job_alert_frequency || "Instant",
   }));
   const [busy, setBusy] = useState(false);
   const set = (k, v) => setF((x) => ({ ...x, [k]: v }));
@@ -51,6 +53,7 @@ export function SmartProfileForm() {
       const body = { ...f, total_experience: exp, expected_ctc: ctc, primary_skills: toList(f.primary_skills), secondary_skills: toList(f.secondary_skills),
         preferred_titles: toList(f.preferred_titles), preferred_locations: toList(f.preferred_locations) };
       Object.keys(body).forEach((k) => (body[k] === "" || body[k] === null) && delete body[k]);
+      if (f.job_alert_consent === (user.job_alert_consent ?? null)) delete body.job_alert_consent;
       await api("/auth/profile", { method: "PUT", body });
       await refresh();
       notify("Professional preferences saved", "success");
@@ -106,12 +109,19 @@ export function SmartProfileForm() {
         <label className="flex items-center justify-between gap-4 rounded-xl bg-brand-mist p-4 text-sm font-semibold">Profile active (visible for matching)
           <Switch checked={f.profile_status === "Active"} onChange={(v) => set("profile_status", v ? "Active" : "Inactive")} data-testid="sp-active" /></label>
       </div>
-      <div className="space-y-3 rounded-xl border border-gray-200 p-4">
-        <label className="flex items-center justify-between gap-4 text-sm font-semibold">
-          <span>Send me job alerts for opportunities JobRadar approves for me<span className="block text-xs font-normal text-gray-500">In-app and email. You can turn this off at any time.</span></span>
-          <Switch checked={f.job_alert_consent} onChange={(v) => set("job_alert_consent", v)} data-testid="sp-alert-consent" />
-        </label>
-        {f.job_alert_consent ? (
+      <div className="space-y-3 rounded-xl border border-gray-200 p-4" data-testid="sp-alerts">
+        <p className="text-sm font-bold">Job alerts</p>
+        <p className="text-xs text-gray-500">JobRadar uses your profile to recommend relevant opportunities on your dashboard. You can change this at any time.</p>
+        <div className="grid gap-2 sm:grid-cols-2">
+          {[[true, "Receive relevant job alerts", "In-app and email alerts for jobs JobRadar approves for you"], [false, "Turn off job alerts", "No job notifications. You can still browse and see matches yourself"]].map(([v, l, d]) => (
+            <button key={String(v)} type="button" onClick={() => set("job_alert_consent", v)} data-testid={`sp-alert-${v ? "on" : "off"}`}
+              className={`rounded-xl border-2 p-3 text-left transition-colors ${f.job_alert_consent === v ? "border-brand bg-brand-mist" : "border-gray-200 hover:border-brand/50"}`}>
+              <p className="text-sm font-bold">{l}</p><p className="text-xs text-gray-500">{d}</p>
+            </button>
+          ))}
+        </div>
+        {f.job_alert_consent === null ? <p className="text-xs text-brand" data-testid="sp-alert-none">Not selected yet — you'll still see relevant opportunities in-app.</p> : null}
+        {f.job_alert_consent === true ? (
           <ChipRow label="Email alert frequency">
             {ALERT_FREQUENCIES.map((n) => <Chip key={n} label={n} selected={f.job_alert_frequency === n} onClick={() => set("job_alert_frequency", n)} data-testid={`sp-freq-${n}`} />)}
           </ChipRow>

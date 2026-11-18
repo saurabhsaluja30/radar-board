@@ -142,7 +142,7 @@ export function SmartMatchCandidates() {
                   <td className="max-w-[220px] truncate px-3 py-3 text-xs">{c.primary_skills.join(", ") || "—"}</td>
                   <td className="px-3 py-3 text-xs">{c.preferred_titles.join(", ") || "—"}<br />{c.preferred_locations.join(", ") || "—"} · {c.preferred_work_mode || "—"}</td>
                   <td className="px-3 py-3"><Badge label={`${c.completion}% complete`} color={c.completion === 100 ? "success" : c.completion >= 60 ? "warning" : "error"} />
-                    <p className="mt-1 text-[11px] text-gray-500">{c.profile_status}{c.job_alert_consent ? " · alerts on" : " · no alert consent"}</p></td>
+                    <p className="mt-1 text-[11px] text-gray-500">{c.profile_status} · {{ enabled: "alerts on", none: "no preference", opted_out: "opted out" }[c.alert_pref]}</p></td>
                   <td className="px-3 py-3"><Button size="sm" variant="outline" title="Find Matching Jobs" onClick={() => navigate(`/admin/smartmatch/candidate/${c.user_id}`)} data-testid={`smc-open-${c.email}`} /></td>
                 </tr>
               ))}
@@ -189,7 +189,7 @@ export function SmartMatchCandidate() {
     ["Preferred locations", `${c.preferred_locations.join(", ") || "—"}${c.preferred_country ? ` · ${c.preferred_country}` : ""}`],
     ["Work mode · Type", `${c.preferred_work_mode || "—"} · ${c.employment_type_pref || "—"}`],
     ["Notice · Relocate", `${c.notice_period || "—"} · ${c.willing_to_relocate ? "Willing to relocate" : "Not specified / no"}`],
-    ["Alerts", c.job_alert_consent ? `Consented · ${c.job_alert_frequency || "Instant"}` : "No consent"],
+    ["Alerts", c.alert_pref === "enabled" ? `On · ${c.job_alert_frequency || "Instant"}` : c.alert_pref === "opted_out" ? "Opted out" : "No preference selected (in-app only)"],
     ["Last profile update", formatDate(c.updated_at)]];
   return (
     <>
@@ -376,6 +376,14 @@ export function SmartMatchAnalytics({ embedded }) {
             <Stat label="Interviews reported" value={data.matches.interviews} testId="sma-interviews" />
             <Stat label="Offers reported" value={data.outcomes.offers_reported} testId="sma-offers" />
           </div>
+          <Card data-testid="sma-alert-prefs">
+            <p className="h-sec mb-3">Job alert preferences & notifications</p>
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-5">
+              {[["Active candidates", "active_candidates"], ["Job alerts enabled", "enabled"], ["No preference selected", "none"], ["Opted out", "opted_out"],
+                ["Eligible for in-app", "eligible_in_app"], ["Notifications sent", "notifications_sent"], ["Notifications delivered", "notifications_delivered"],
+                ["Notifications failed", "notifications_failed"], ["Candidate responses", "candidate_responses"]].map(([l, k]) => <Stat key={k} label={l} value={data.alert_prefs[k]} testId={`sma-ap-${k}`} />)}
+            </div>
+          </Card>
           <div className="grid gap-5 lg:grid-cols-2">
             <Card data-testid="sma-kpis">
               <p className="h-sec mb-3">Performance indicators</p>
@@ -400,6 +408,91 @@ export function SmartMatchAnalytics({ embedded }) {
           </div>
         </div>
       )}
+    </>
+  );
+}
+
+const RECIPIENT_FILTERS = [["eligible", "All eligible active candidates"], ["complete", "Completed profiles"], ["incomplete", "Incomplete profiles"],
+  ["enabled", "Job alerts enabled"], ["none", "No preference selected"], ["opted_out", "Opted out (view only)"]];
+
+export function AlertManager() {
+  const qc = useQueryClient();
+  const [jobId, setJobId] = useState("");
+  const [rf, setRf] = useState("eligible");
+  const [status, setStatus] = useState("All");
+  const [view, setView] = useState("candidates");
+  const [busy, setBusy] = useState(false);
+  const { data: jobs } = useQuery({ queryKey: ["am-jobs"], queryFn: () => api("/admin/alert-manager/jobs") });
+  const { data: rec } = useQuery({ queryKey: ["am-recipients", jobId], queryFn: () => api(`/admin/alert-manager/jobs/${jobId}/recipients`), enabled: !!jobId && view === "received" });
+  const job = jobs?.jobs.find((j) => j.job_id === jobId);
+  const find = async () => {
+    setBusy(true);
+    try {
+      const res = await api(`/admin/smartmatch/jobs/${jobId}/find-candidates`, { method: "POST" });
+      notify(`${res.scored} candidates scored`, "success");
+      qc.invalidateQueries({ queryKey: ["sm-matches"] });
+      qc.invalidateQueries({ queryKey: ["am-jobs"] });
+    } catch (e) {
+      notify(errMsg(e), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const filters = clean({ job_id: jobId, status, ...(["complete", "incomplete"].includes(rf) ? { profile: rf, alert_pref: "eligible" } : { alert_pref: rf }) });
+  return (
+    <>
+      <PageHeader title="JobRadar Job Alert Manager" subtitle="Pick a verified, open job, find relevant candidates, approve them and send in-app notifications. Opted-out candidates are never notified." />
+      <Card className="mb-5 space-y-4" data-testid="am-job-picker">
+        <label className="block"><span className="label">Verified, active job</span>
+          <select className="field mt-1.5" value={jobId} onChange={(e) => setJobId(e.target.value)} data-testid="am-job-select">
+            <option value="">Select a job…</option>
+            {(jobs?.jobs || []).map((j) => <option key={j.job_id} value={j.job_id}>{j.title} — {j.company} ({j.location || j.city || "—"}) · {j.matches} matched · {j.notified} notified</option>)}
+          </select>
+        </label>
+        {jobs && jobs.jobs.length === 0 ? <p className="text-sm text-amber-700">No verified, open, non-expired jobs. Verify and publish a job in Job Management first.</p> : null}
+        {job ? (
+          <div className="flex flex-wrap items-center gap-3">
+            <Button title="Find Matching Candidates" icon={<Search className="h-4 w-4" />} loading={busy} onClick={find} data-testid="am-find" />
+            <span className="text-sm text-gray-500">{job.matches} matched · {job.approved} approved · {job.notified} received in-app</span>
+          </div>
+        ) : null}
+      </Card>
+      {job ? (
+        <>
+          <div className="mb-4 flex gap-2">
+            <Chip label="Candidates" selected={view === "candidates"} onClick={() => setView("candidates")} data-testid="am-view-candidates" />
+            <Chip label="Already received / delivery status" selected={view === "received"} onClick={() => setView("received")} data-testid="am-view-received" />
+          </div>
+          {view === "candidates" ? (
+            <>
+              <Card className="mb-5 space-y-4" data-testid="am-filters">
+                <Chips label="Recipients" value={rf} options={RECIPIENT_FILTERS.map((x) => x[0])} short={(o) => (o === "All" ? "Everyone" : RECIPIENT_FILTERS.find((x) => x[0] === o)?.[1])} onChange={setRf} testId="am-rf" />
+                <Chips label="Review status" value={status} options={Object.keys(MATCH_STATUS_LABEL)} short={(o) => MATCH_STATUS_LABEL[o] || o} onChange={setStatus} testId="am-status" />
+              </Card>
+              <MatchTable filters={filters} mode="job" title="Suggested candidates" defaultChannels={["in_app"]} />
+            </>
+          ) : (
+            <Card className="overflow-x-auto p-0" data-testid="am-received">
+              {!rec ? <Spinner /> : rec.recipients.length === 0 ? <div className="p-6"><EmptyState title="Nobody has been notified about this job yet" /></div> : (
+                <table className="w-full text-sm">
+                  <thead className="bg-gray-50/70 text-left text-xs uppercase tracking-wider text-gray-400"><tr><th className="px-4 py-3">Candidate</th><th className="px-3">Channel</th><th className="px-3">Status</th><th className="px-3">Sent</th><th className="px-3">Read</th></tr></thead>
+                  <tbody className="divide-y divide-gray-100">
+                    {rec.recipients.map((n) => (
+                      <tr key={n.notification_id} data-testid={`am-rec-${n.notification_id}`}>
+                        <td className="px-4 py-3"><p className="font-bold">{n.candidate_name || "—"}</p><p className="text-xs text-gray-500">{n.candidate_email}</p></td>
+                        <td className="px-3">{n.channel === "email" ? "Email" : "In-app"}</td>
+                        <td className="px-3"><Badge label={n.status === "sent" ? "Delivered" : n.status} color={n.status === "sent" ? "success" : "error"} />{n.error ? <p className="text-[11px] text-red-600">{n.error}</p> : null}</td>
+                        <td className="px-3 text-xs">{n.sent_at ? new Date(n.sent_at).toLocaleString("en-IN") : "—"}</td>
+                        <td className="px-3 text-xs">{n.channel === "in_app" ? (n.read_at ? "Read" : "Unread") : "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </Card>
+          )}
+        </>
+      ) : null}
     </>
   );
 }
