@@ -31,8 +31,8 @@ export const PREF_WORK_MODES = ["Work From Office", "Hybrid", "Remote", "Any"];
 export const CURRENCIES = ["INR", "USD", "GBP", "EUR", "AED", "SGD", "AUD", "CAD"];
 export const WORK_MODES = ["Work From Office", "Hybrid", "Remote"];
 export const EXPERIENCE_RANGES = ["0-2 years", "2-5 years", "5-8 years", "8+ years"];
-export const JOB_STATUSES = ["Draft", "Published", "Unpublished", "Expired", "Closed"];
-export const JOB_STATUS_LABEL = { Draft: "Draft", Published: "Open", Unpublished: "Paused", Expired: "Expired", Closed: "Closed" };
+export const JOB_STATUSES = ["Draft", "Published", "Unpublished", "Expired", "Closed", "Archived"];
+export const JOB_STATUS_LABEL = { Draft: "Draft", Published: "Open", Unpublished: "Paused", Expired: "Expired", Closed: "Closed", Archived: "Archived" };
 export const VERIFICATION_STATUSES = ["Pending Verification", "Verified", "Rejected"];
 export const JOB_SOURCES = ["EevolveX recruitment assignment", "Direct employer submission", "Recruiter submission",
   "Approved external job feed / API", "Other authorised source"];

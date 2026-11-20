@@ -26,6 +26,8 @@ load_dotenv(ROOT_DIR / ".env")
 mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ["DB_NAME"]]
+import ops as _ops  # noqa: E402
+_ops.init(db)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("jobradar")
@@ -219,6 +221,16 @@ def now_iso() -> str:
     return now_utc().isoformat()
 
 
+def live_job_q(**extra) -> dict:
+    """Publicly visible jobs: published, verified and not past expiry. Filters expiry itself so it stays
+    correct between the (throttled) expiry sweeps."""
+    q = {"status": "Published", "verification_status": "Verified",
+         "$and": [{"$or": [{"expiry_date": {"$exists": False}}, {"expiry_date": {"$in": [None, ""]}},
+                           {"expiry_date": {"$gte": now_utc().date().isoformat()}}]}]}
+    q.update(extra)
+    return q
+
+
 def hash_pw(pw: str) -> str:
     return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
 
@@ -313,6 +325,23 @@ async def compute_membership(candidate_id: str) -> dict:
     sub = await db.subscriptions.find_one(
         {"candidate_id": candidate_id}, {"_id": 0}, sort=[("created_at", -1)]
     )
+    return membership_from_sub(sub)
+
+
+async def compute_memberships(candidate_ids: Optional[list] = None) -> dict:
+    """Bulk compute_membership: {candidate_id: membership} from one aggregation over subscriptions.
+    `None` means every candidate that has a subscription; ids with no subscription get the empty membership."""
+    pipeline = []
+    if candidate_ids is not None:
+        pipeline.append({"$match": {"candidate_id": {"$in": list(candidate_ids)}}})
+    pipeline += [{"$sort": {"candidate_id": 1, "created_at": -1}},
+                 {"$group": {"_id": "$candidate_id", "sub": {"$first": "$$ROOT"}}}]
+    latest = {d["_id"]: d["sub"] for d in await db.subscriptions.aggregate(pipeline, allowDiskUse=True).to_list(None)}
+    ids = candidate_ids if candidate_ids is not None else latest.keys()
+    return {cid: membership_from_sub(latest.get(cid)) for cid in ids}
+
+
+def membership_from_sub(sub: Optional[dict]) -> dict:
     base = {
         "status": "no_membership", "is_active": False, "plan_id": None, "plan_name": None,
         "start_date": None, "expiry_date": None, "days_remaining": 0,
@@ -393,7 +422,7 @@ async def audit_log(admin: dict, action: str, entity: str, entity_id: str, detai
 def _validate_job(job: dict):
     if job.get("verification_status") not in ("Pending Verification", "Verified", "Rejected"):
         raise HTTPException(status_code=400, detail="Invalid verification status")
-    if job.get("status") not in ("Draft", "Published", "Unpublished", "Expired", "Closed"):
+    if job.get("status") not in ("Draft", "Published", "Unpublished", "Expired", "Closed", "Archived"):
         raise HTTPException(status_code=400, detail="Invalid job status")
     lo, hi = job.get("experience_min"), job.get("experience_max")
     if lo is not None and hi is not None and lo > hi:
@@ -429,6 +458,7 @@ class RegisterReq(BaseModel):
     preferred_designation: Optional[str] = None
     preferred_work_mode: Optional[str] = None
     consent: bool = False
+    talent_db_consent: Optional[bool] = None
 
 
 class LoginReq(BaseModel):
@@ -481,6 +511,15 @@ class ProfileReq(BaseModel):
     employment_type_pref: Optional[str] = None
     profile_status: Optional[str] = None
     job_alert_consent: Optional[bool] = None
+    talent_db_consent: Optional[bool] = None
+    current_location: Optional[str] = None
+    relevant_experience: Optional[float] = None
+    tools: Optional[List[str]] = None
+    certifications: Optional[List[str]] = None
+    highest_qualification: Optional[str] = None
+    institution: Optional[str] = None
+    preferred_countries: Optional[List[str]] = None
+    alert_muted_industries: Optional[List[str]] = None
     job_alert_frequency: Optional[str] = None
 
 
@@ -591,6 +630,7 @@ async def register(req: RegisterReq):
         "preferred_designation": req.preferred_designation,
         "preferred_work_mode": req.preferred_work_mode,
         "consent": req.consent,
+        "talent_db_consent": req.talent_db_consent is True,
         "suspended": False,
         "picture": None,
         "created_at": now_iso(),
@@ -598,6 +638,12 @@ async def register(req: RegisterReq):
         "status": "active",
     }
     await db.users.insert_one(dict(doc))
+    if req.talent_db_consent is not None:
+        await db.consent_records.insert_one({"consent_id": f"cs_{uuid.uuid4().hex[:12]}", "user_id": user_id,
+                                             "type": "talent_database", "granted": req.talent_db_consent is True,
+                                             "source": "registration", "at": now_iso()})
+    await _resume_helpers["set_completion"](user_id)
+    await _sm_helpers["candidate_changed"](user_id, "registered")
     offer = await _apply_launch_offer(user_id)
     token = await create_session(user_id)
     inner = (f'<p style="color:#374151;font-size:15px">Hi {escape(req.full_name)},</p>'
@@ -736,15 +782,25 @@ async def update_profile(req: ProfileReq, user=Depends(get_current_user)):
                        ("employment_type_pref", ("Full-time", "Part-time", "Contract", "Internship", "Any"))):
         if k in updates and updates[k] not in allowed:
             raise HTTPException(status_code=400, detail=f"Invalid {k.replace('_', ' ')}")
-    for k in ("primary_skills", "secondary_skills", "preferred_titles", "preferred_locations"):
+    if updates.get("relevant_experience") is not None and not 0 <= updates["relevant_experience"] <= 60:
+        raise HTTPException(status_code=400, detail="Relevant experience must be between 0 and 60 years")
+    for k in ("primary_skills", "secondary_skills", "preferred_titles", "preferred_locations", "tools", "certifications",
+              "preferred_countries", "alert_muted_industries"):
         if k in updates:
             updates[k] = list(dict.fromkeys(x.strip()[:80] for x in updates[k] if x and x.strip()))[:30]
+    if "talent_db_consent" in updates and (user.get("talent_db_consent") is True) is not updates["talent_db_consent"]:
+        await db.consent_records.insert_one({"consent_id": f"cs_{uuid.uuid4().hex[:12]}", "user_id": user["user_id"],
+                                             "type": "talent_database", "granted": updates["talent_db_consent"],
+                                             "source": "profile", "at": now_iso()})
     if "job_alert_consent" in updates and user.get("job_alert_consent") is not updates["job_alert_consent"]:
         await db.consent_records.insert_one({"consent_id": f"cs_{uuid.uuid4().hex[:12]}", "user_id": user["user_id"],
                                              "type": "job_alerts", "granted": updates["job_alert_consent"],
                                              "source": "profile", "at": now_iso()})
     updates["updated_at"] = now_iso()
     await db.users.update_one({"user_id": user["user_id"]}, {"$set": updates})
+    await _resume_helpers["set_completion"](user["user_id"])
+    if user.get("role") == "candidate":
+        await _sm_helpers["candidate_changed"](user["user_id"], "profile updated")
     updated = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0, "password": 0})
     return {"user": updated}
 
@@ -796,7 +852,7 @@ async def list_jobs(
     limit: int = 50,
 ):
     await _sm_helpers["sweep_expired"]()
-    query: dict = {"status": "Published", "verification_status": "Verified"}
+    query: dict = live_job_q()
     if function and function != "All":
         query["function"] = function
     if location:
@@ -836,7 +892,7 @@ async def list_jobs(
 @api.get("/jobs/{job_id}")
 async def get_job(job_id: str, user=Depends(get_optional_user)):
     await _sm_helpers["sweep_expired"]()
-    job = await db.jobs.find_one({"job_id": job_id, "status": "Published", "verification_status": "Verified"},
+    job = await db.jobs.find_one(live_job_q(job_id=job_id),
                                  {"_id": 0, "admin_notes": 0, "verification_score": 0})
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1097,12 +1153,12 @@ async def dashboard(user=Depends(get_current_user)):
     saved_jobs_docs = await db.jobs.find({"job_id": {"$in": saved_ids}},
                                          {"_id": 0, "admin_notes": 0, "verification_score": 0}).to_list(20)
     smap = {j["job_id"]: j for j in saved_jobs_docs}
-    recent = await db.jobs.find({"status": "Published", "verification_status": "Verified"}, {"_id": 0, "admin_notes": 0, "verification_score": 0}).sort(
+    recent = await db.jobs.find(live_job_q(), {"_id": 0, "admin_notes": 0, "verification_score": 0}).sort(
         "date_added", -1).limit(6).to_list(6)
     pref_inds = user.get("preferred_industries") or []
     if not pref_inds and user.get("industry"):
         pref_inds = [user.get("industry")]
-    rec_query = {"status": "Published", "verification_status": "Verified"}
+    rec_query = live_job_q()
     if pref_inds:
         rec_query["industry_category"] = {"$in": pref_inds}
     wm = user.get("preferred_work_mode")
@@ -1112,10 +1168,10 @@ async def dashboard(user=Depends(get_current_user)):
         [("featured", -1), ("date_added", -1)]).limit(8).to_list(8)
     if not recommended and pref_inds:
         recommended = await db.jobs.find(
-            {"status": "Published", "verification_status": "Verified", "industry_category": {"$in": pref_inds}},
+            live_job_q(industry_category={"$in": pref_inds}),
             {"_id": 0, "admin_notes": 0, "verification_score": 0}).limit(8).to_list(8)
     if not recommended:
-        recommended = await db.jobs.find({"status": "Published", "verification_status": "Verified"},
+        recommended = await db.jobs.find(live_job_q(),
             {"_id": 0, "admin_notes": 0, "verification_score": 0}).sort("featured", -1).limit(6).to_list(6)
     payments = await db.payments.find({"candidate_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).to_list(20)
     return {
@@ -1143,38 +1199,46 @@ async def contact(payload: dict):
 @api.get("/admin/dashboard")
 async def admin_dashboard(admin=Depends(require_admin)):
     total_candidates = await db.users.count_documents({"role": "candidate"})
-    all_subs = await db.subscriptions.find({}, {"_id": 0}).to_list(5000)
-    candidates = await db.users.find({"role": "candidate"}, {"_id": 0, "user_id": 1}).to_list(5000)
+    # Only candidates with a subscription can be active/expired, so one aggregation covers everyone.
+    cand_ids = set(await db.users.distinct("user_id", {"role": "candidate"}))
     active = expired = 0
-    for c in candidates:
-        m = await compute_membership(c["user_id"])
+    for cid, m in (await compute_memberships()).items():
+        if cid not in cand_ids:
+            continue
         if m["is_active"]:
             active += 1
         elif m["status"] == "expired":
             expired += 1
-    payments = await db.payments.find({}, {"_id": 0}).to_list(10000)
-    real_success = [p for p in payments if p["status"] == "successful" and not p.get("is_demo")]
-    demo_success = [p for p in payments if p["status"] == "successful" and p.get("is_demo")]
-    real_revenue = sum(p["amount"] for p in real_success)
-    demo_revenue = sum(p["amount"] for p in demo_success)
+    # Payments: totals are summed on the database; only this month's real payments are loaded.
+    by_kind = {d["_id"]: d for d in await db.payments.aggregate([
+        {"$match": {"status": "successful"}},
+        {"$group": {"_id": {"$cond": [{"$ifNull": ["$is_demo", False]}, "demo", "real"]},
+                    "n": {"$sum": 1}, "amount": {"$sum": "$amount"}}}]).to_list(None)}
+    real, demo = by_kind.get("real", {}), by_kind.get("demo", {})
+    real_revenue, demo_revenue = real.get("amount", 0), demo.get("amount", 0)
     now = now_utc()
-    month_revenue = sum(p["amount"] for p in real_success
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    month_rows = await db.payments.find(
+        {"status": "successful", "is_demo": {"$in": [False, None]},
+         # payment_date is an ISO string; ISO strings sort by date. Missing dates count as "now" (as before).
+         "$or": [{"payment_date": {"$gte": month_start.isoformat()[:7]}}, {"payment_date": {"$in": [None, ""]}}]},
+        {"_id": 0, "amount": 1, "payment_date": 1}).to_list(None)
+    month_revenue = sum(p["amount"] for p in month_rows
                         if (parse_dt(p.get("payment_date")) or now).month == now.month and
                         (parse_dt(p.get("payment_date")) or now).year == now.year)
     week_ago = now - timedelta(days=7)
     new_regs = await db.users.count_documents({"role": "candidate", "created_at": {"$gte": week_ago.isoformat()}})
-    plan_counts: dict = {}
-    for s in all_subs:
-        plan_counts[s.get("plan_name", "?")] = plan_counts.get(s.get("plan_name", "?"), 0) + 1
-    popular = max(plan_counts, key=plan_counts.get) if plan_counts else None
+    top_plan = await db.subscriptions.aggregate([{"$group": {"_id": {"$ifNull": ["$plan_name", "?"]}, "n": {"$sum": 1}}},
+                                                 {"$sort": {"n": -1}}, {"$limit": 1}]).to_list(1)
+    popular = top_plan[0]["_id"] if top_plan else None
     jobs_published = await db.jobs.count_documents({"status": "Published"})
     jobs_week = await db.jobs.count_documents({"date_added": {"$gte": week_ago.isoformat()}})
-    all_jobs = await db.jobs.find({}, {"_id": 0, "views": 1}).to_list(5000)
-    total_views = sum(j.get("views", 0) for j in all_jobs)
+    views = await db.jobs.aggregate([{"$group": {"_id": None, "v": {"$sum": "$views"}}}]).to_list(1)
+    total_views = views[0]["v"] if views else 0
     most_saved = await db.jobs.find({}, {"_id": 0, "title": 1, "company": 1, "saves": 1}).sort("saves", -1).limit(5).to_list(5)
     return {
         "total_candidates": total_candidates, "active_members": active, "expired_members": expired,
-        "new_registrations_week": new_regs, "total_successful_payments": len(real_success) + len(demo_success),
+        "new_registrations_week": new_regs, "total_successful_payments": real.get("n", 0) + demo.get("n", 0),
         "real_revenue": real_revenue, "demo_revenue": demo_revenue, "monthly_revenue": month_revenue,
         "popular_plan": popular, "jobs_published": jobs_published, "jobs_added_week": jobs_week,
         "total_job_views": total_views, "most_saved_jobs": most_saved,
@@ -1186,7 +1250,7 @@ async def admin_list_jobs(admin=Depends(require_admin), q: Optional[str] = None,
                           industry_category: Optional[str] = None, region: Optional[str] = None,
                           country: Optional[str] = None, verification_status: Optional[str] = None,
                           job_source: Optional[str] = None, location: Optional[str] = None, company: Optional[str] = None):
-    await _sm_helpers["sweep_expired"]()
+    await _sm_helpers["sweep_expired"](force=True)
     query: dict = {}
     if status and status != "All":
         query["status"] = status
@@ -1217,12 +1281,15 @@ async def admin_create_job(req: JobReq, admin=Depends(require_admin)):
     _validate_job(job)
     job.update({
         "job_id": f"job_{uuid.uuid4().hex[:10]}", "date_added": now_iso(), "last_updated": now_iso(),
+        "dedupe_key": _dedupe_key(job.get("company"), job.get("title"), job.get("location")),
         "views": 0, "saves": 0, "apply_clicks": 0, "date_received": job.get("date_received") or now_iso()[:10],
         "date_published": now_iso() if job.get("status") == "Published" else None,
     })
     await db.jobs.insert_one(dict(job))
+    _sm_helpers["invalidate_jobs"]()
     job.pop("_id", None)
-    await _sm_helpers["sweep_expired"]()
+    await _sm_helpers["sweep_expired"](force=True)
+    await _sm_helpers["job_changed"](job["job_id"], "job created")
     await audit_log(admin, "create_job", "job", job["job_id"], {"title": job["title"], "status": job["status"]})
     return {"job": job}
 
@@ -1240,13 +1307,16 @@ async def admin_update_job(job_id: str, req: JobReq, admin=Depends(require_admin
     updates = req.dict()
     _validate_job(updates)
     updates["last_updated"] = now_iso()
+    updates["dedupe_key"] = _dedupe_key(updates.get("company"), updates.get("title"), updates.get("location"))
     prev = await db.jobs.find_one({"job_id": job_id}, {"_id": 0, "date_published": 1, "verification_status": 1})
     if not prev:
         raise HTTPException(status_code=404, detail="Job not found")
     if updates.get("status") == "Published" and not prev.get("date_published"):
         updates["date_published"] = now_iso()
     await db.jobs.update_one({"job_id": job_id}, {"$set": updates})
-    await _sm_helpers["sweep_expired"]()
+    _sm_helpers["invalidate_jobs"]()
+    await _sm_helpers["sweep_expired"](force=True)
+    await _sm_helpers["job_changed"](job_id, "job edited")
     await audit_log(admin, "update_job", "job", job_id, {"status": updates.get("status"),
                     "verification_status": updates.get("verification_status")})
     job = await db.jobs.find_one({"job_id": job_id}, {"_id": 0})
@@ -1256,6 +1326,10 @@ async def admin_update_job(job_id: str, req: JobReq, admin=Depends(require_admin
 @api.delete("/admin/jobs/{job_id}")
 async def admin_delete_job(job_id: str, admin=Depends(require_admin)):
     await db.jobs.delete_one({"job_id": job_id})
+    # Matches and alerts for a deleted job point at nothing; remove them so counts and lists stay accurate.
+    await db.job_matches.delete_many({"job_id": job_id})
+    await db.job_notifications.delete_many({"job_id": job_id})
+    _sm_helpers["invalidate_jobs"]()
     await audit_log(admin, "delete_job", "job", job_id, {})
     return {"success": True}
 
@@ -1271,6 +1345,8 @@ async def admin_job_status(job_id: str, payload: dict, admin=Depends(require_adm
         if prev and not prev.get("date_published"):
             upd["date_published"] = now_iso()
     await db.jobs.update_one({"job_id": job_id}, {"$set": upd})
+    _sm_helpers["invalidate_jobs"]()
+    await _sm_helpers["job_changed"](job_id, f"status set to {status}")
     await audit_log(admin, "job_status", "job", job_id, {"status": status})
     return {"success": True}
 
@@ -1278,6 +1354,7 @@ async def admin_job_status(job_id: str, payload: dict, admin=Depends(require_adm
 @api.post("/admin/jobs/{job_id}/feature")
 async def admin_feature_job(job_id: str, payload: dict, admin=Depends(require_admin)):
     await db.jobs.update_one({"job_id": job_id}, {"$set": {"featured": bool(payload.get("featured")), "last_updated": now_iso()}})
+    _sm_helpers["invalidate_jobs"]()
     await audit_log(admin, "feature_job", "job", job_id, {"featured": bool(payload.get("featured"))})
     return {"success": True}
 
@@ -1291,7 +1368,12 @@ async def admin_duplicate_job(job_id: str, admin=Depends(require_admin)):
                 "status": "Draft", "date_added": now_iso(), "last_updated": now_iso(),
                 "views": 0, "saves": 0, "apply_clicks": 0, "verification_status": "Pending Verification",
                 "date_published": None})
+    # A copy is a new listing: it must not claim the original's source URL (unique) or import state.
+    for k in ("original_url", "source_snapshot", "last_import_run", "review_status", "imported_via", "duplicate_of"):
+        job.pop(k, None)
+    job["dedupe_key"] = _dedupe_key(job.get("company"), job.get("title"), job.get("location"))
     await db.jobs.insert_one(dict(job))
+    _sm_helpers["invalidate_jobs"]()
     job.pop("_id", None)
     await audit_log(admin, "duplicate_job", "job", job["job_id"], {"from": job_id})
     return {"job": job}
@@ -1310,9 +1392,10 @@ async def admin_candidates(admin=Depends(require_admin), q: Optional[str] = None
     if conds:
         query["$and"] = conds
     users = await db.users.find(query, {"_id": 0, "password": 0}).sort("created_at", -1).to_list(1000)
+    ms = await compute_memberships([u["user_id"] for u in users])
     out = []
     for u in users:
-        m = await compute_membership(u["user_id"])
+        m = ms[u["user_id"]]
         out.append({**u, "membership_status": m["status"], "is_active": m["is_active"],
                     "plan_name": m["plan_name"], "expiry_date": m["expiry_date"]})
     return {"candidates": out}
@@ -1353,10 +1436,14 @@ async def admin_extend(candidate_id: str, payload: dict, admin=Depends(require_a
 @api.get("/admin/subscriptions")
 async def admin_subscriptions(admin=Depends(require_admin), status: Optional[str] = None):
     subs = await db.subscriptions.find({}, {"_id": 0}).sort("created_at", -1).to_list(2000)
+    cids = list({s["candidate_id"] for s in subs})
+    ms = await compute_memberships(cids)
+    people = {u["user_id"]: u for u in await db.users.find({"user_id": {"$in": cids}},
+                                                          {"_id": 0, "user_id": 1, "full_name": 1, "email": 1}).to_list(None)}
     out = []
     for s in subs:
-        m = await compute_membership(s["candidate_id"])
-        u = await db.users.find_one({"user_id": s["candidate_id"]}, {"_id": 0, "full_name": 1, "email": 1})
+        m = ms[s["candidate_id"]]
+        u = people.get(s["candidate_id"])
         eff = m["status"] if m["subscription_id"] == s["subscription_id"] else s["status"]
         if status and status != "All" and eff != status:
             continue
@@ -1463,7 +1550,7 @@ async def cron_email_retry(request: Request, authorization: Optional[str] = Head
                                       {"_id": 0}).sort("date_sent", 1).to_list(EMAIL_RETRY_BATCH)
     ids = [f["email_id"] for f in failed]
     await db.email_logs.update_many({"email_id": {"$in": ids}}, {"$set": {"delivery_status": "retried"}, "$unset": {"retry_html": ""}})
-    _bg(_resend(failed))
+    _bg(_ops.tracked("email-retry", _resend(failed)))
     return {"accepted": True, "queued": len(failed)}
 
 
@@ -1619,9 +1706,10 @@ async def dev_action(req: DevActionReq, admin=Depends(require_admin)):
 @api.get("/admin/dev/candidates")
 async def dev_candidates(admin=Depends(require_admin)):
     users = await db.users.find({"role": "candidate"}, {"_id": 0, "user_id": 1, "full_name": 1, "email": 1}).sort("created_at", -1).to_list(1000)
+    ms = await compute_memberships([u["user_id"] for u in users])
     out = []
     for u in users:
-        m = await compute_membership(u["user_id"])
+        m = ms[u["user_id"]]
         out.append({**u, "status": m["status"], "expiry_date": m["expiry_date"], "days_remaining": m["days_remaining"]})
     return {"candidates": out}
 
@@ -1802,9 +1890,62 @@ async def startup():
         await db.match_reviews.create_index("match_id")
         await db.candidate_job_activity.create_index([("candidate_id", 1), ("at", -1)])
         await db.admin_audit_log.create_index([("at", -1)])
+        # Hot-path lookups that previously scanned whole collections.
+        await db.jobs.create_index([("status", 1), ("verification_status", 1), ("date_added", -1)])
+        await db.jobs.create_index([("status", 1), ("expiry_date", 1)])
+        await db.subscriptions.create_index([("candidate_id", 1), ("created_at", -1)])
+        await db.saved_jobs.create_index([("candidate_id", 1), ("created_at", -1)])
+        await db.payments.create_index([("candidate_id", 1), ("created_at", -1)])
+        await db.users.create_index([("role", 1), ("created_at", -1)])
+        await db.user_sessions.create_index("user_id")
+        await db.email_logs.create_index([("delivery_status", 1), ("date_sent", 1)])
+        await db.email_logs.create_index([("created_at", -1)])
+        await db.job_notifications.create_index([("job_id", 1), ("status", 1)])
+        await db.job_notifications.create_index([("candidate_id", 1), ("channel", 1), ("sent_at", -1)])
+        await db.job_matches.create_index([("candidate_id", 1), ("status", 1)])
+        await db.candidate_job_activity.create_index([("candidate_id", 1), ("type", 1)])
+        await db.tracker_evidence.create_index([("tracker_id", 1), ("is_deleted", 1)])
+        # Resumes + talent database
+        await db.candidate_resumes.create_index("resume_id", unique=True)
+        await db.candidate_resumes.create_index([("candidate_id", 1), ("is_current", 1)])
+        await db.candidate_resumes.create_index([("status", 1), ("lock_until", 1)])
+        await db.candidate_resumes.create_index([("candidate_id", 1), ("sha256", 1)])
+        await db.users.create_index([("talent_db_consent", 1), ("role", 1), ("created_at", -1)])
+        await db.users.create_index("resume_keywords")
+        await db.users.create_index("tools")
+        await db.users.create_index("certifications")
+        await db.users.create_index("current_location")
+        await db.users.create_index("has_resume")
+        await db.users.create_index([("role", 1), ("current_designation", 1)])
+        # Apify job discovery
+        await db.jobs.create_index("original_url", unique=True, partialFilterExpression={"original_url": {"$type": "string"}})
+        await db.jobs.create_index("dedupe_key")
+        await db.jobs.create_index([("imported_via", 1), ("review_status", 1), ("imported_at", -1)])
+        await db.jobs.create_index("source_id")
+        await db.job_sources.create_index("source_id", unique=True)
+        await db.apify_runs.create_index("run_id", unique=True)
+        await db.apify_runs.create_index("apify_run_id")
+        await db.apify_runs.create_index([("processed", 1), ("started_at", -1)])
+        await db.job_import_logs.create_index([("job_id", 1), ("at", -1)])
+        await db.job_import_logs.create_index("original_url")
+        await db.job_import_logs.create_index("at_dt", expireAfterSeconds=180 * 24 * 3600)
+        # SmartMatch queue: one queued item per job/candidate at a time; finished items kept 7 days.
+        await db.match_queue.create_index([("kind", 1), ("ref_id", 1)], unique=True, partialFilterExpression={"status": "queued"},
+                                          name="one_queued_per_ref")
+        await db.match_queue.create_index([("status", 1), ("created_at", 1)])
+        await db.match_queue.create_index("queue_id", unique=True)
+        await db.match_queue.create_index("done_at", expireAfterSeconds=7 * 24 * 3600)
+        await _ops.ensure_indexes(db)
     except Exception as e:
         logger.warning(f"Index creation: {e}")
     await seed()
+    # One-time backfill: duplicate detection compares imports against every job's company/title/location key.
+    async for j in db.jobs.find({"dedupe_key": {"$exists": False}}, {"_id": 0, "job_id": 1, "company": 1, "title": 1, "location": 1}):
+        await db.jobs.update_one({"job_id": j["job_id"]}, {"$set": {"dedupe_key": _dedupe_key(j.get("company"), j.get("title"), j.get("location"))}})
+    # One-time backfill so the talent database can filter on profile completion with an index.
+    from smartmatch import profile_status as _profile_status
+    async for u in db.users.find({"role": "candidate", "profile_completion": {"$exists": False}}, {"_id": 0, "password": 0}):
+        await db.users.update_one({"user_id": u["user_id"]}, {"$set": {"profile_completion": _profile_status(u)["completion"]}})
     await db.jobs.update_many({"verification_status": {"$exists": False}}, {"$set": {"verification_status": "Verified"}})
     await db.jobs.update_many({"job_source": {"$exists": False}}, {"$set": {"job_source": "Other authorised source"}})
     # Undo implicit opt-outs saved by the old form (no explicit consent record) so a blank stays "not selected".
@@ -1835,12 +1976,24 @@ from demand import build_router as _build_demand_router  # noqa: E402
 from smartmatch import build_router as _build_sm_router  # noqa: E402
 
 _sm_router, _sm_helpers = _build_sm_router(db, get_current_user, require_admin, compute_membership, send_and_log_email,
-                                           _wrap_email, serialize_job, now_iso, audit_log)
+                                           _wrap_email, serialize_job, now_iso, audit_log, bg=_bg)
 api.include_router(_build_tracker_router(db, get_current_user, require_admin, compute_membership, send_and_log_email,
                                          _wrap_email, now_utc, now_iso, parse_dt, hooks=[_sm_helpers["on_tracker_status"]]))
 api.include_router(_sm_router)
-api.include_router(_build_demand_router(db, require_admin, compute_membership, now_utc))
+api.include_router(_build_demand_router(db, require_admin, compute_memberships, now_utc))
+from resumes import build_router as _build_resume_router  # noqa: E402
+
+_resume_router, _resume_helpers = _build_resume_router(db, get_current_user, require_admin, audit_log, now_iso, _bg,
+                                                       on_profile_change=_sm_helpers["candidate_changed"])
+api.include_router(_resume_router)
+from apify_jobs import build_router as _build_apify_router, dedupe_key as _dedupe_key  # noqa: E402
+
+_apify_router, _apify_helpers = _build_apify_router(db, require_admin, audit_log, now_iso, _bg, _sm_helpers)
+api.include_router(_apify_router)
+_ops_router, _ = _ops.build_router(db, require_admin, live_job_q)
+api.include_router(_ops_router)
 app.include_router(api)
+app.add_middleware(_ops.MetricsMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,

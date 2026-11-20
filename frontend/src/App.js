@@ -22,7 +22,10 @@ import { CareerHistory, InterviewSession, InterviewSetup } from "@/pages/career/
 import { AdminDashboard, AdminShell } from "@/pages/admin/AdminShell";
 import { AdminCandidates, AdminJobEdit, AdminJobs, AdminPayments, AdminSubscriptions } from "@/pages/admin/AdminManage";
 import { AdminDemand, AdminRegistration, AdminSuccess } from "@/pages/admin/AdminAnalytics";
+import { AdminPlatformAnalytics, AdminSystemHealth } from "@/pages/admin/AdminPlatform";
 import { AdminCareer, AdminDevPanel, AdminEmails, AdminLaunch } from "@/pages/admin/AdminTools";
+import { AdminResumeStorage, AdminTalent } from "@/pages/admin/AdminTalent";
+import { AdminImportReview, AdminJobSources } from "@/pages/admin/AdminImports";
 import { useAuth } from "@/context/AuthContext";
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: true, staleTime: 15000 } } });
@@ -82,12 +85,18 @@ export default function App() {
               <Route path="jobs" element={<AdminJobs />} />
               <Route path="job-edit" element={<AdminJobEdit />} />
               <Route path="candidates" element={<AdminCandidates />} />
+              <Route path="talent" element={<AdminTalent />} />
+              <Route path="job-sources" element={<AdminJobSources />} />
+              <Route path="import-review" element={<AdminImportReview />} />
+              <Route path="resume-storage" element={<AdminResumeStorage />} />
               <Route path="subscriptions" element={<AdminSubscriptions />} />
               <Route path="payments" element={<AdminPayments />} />
               <Route path="emails" element={<AdminEmails />} />
               <Route path="dev-panel" element={<AdminDevPanel />} />
               <Route path="launch" element={<AdminLaunch />} />
               <Route path="career" element={<AdminCareer />} />
+              <Route path="platform-analytics" element={<AdminPlatformAnalytics />} />
+              <Route path="system-health" element={<AdminSystemHealth />} />
               <Route path="registration" element={<AdminRegistration />} />
               <Route path="demand" element={<AdminDemand />} />
               <Route path="success" element={<AdminSuccess />} />

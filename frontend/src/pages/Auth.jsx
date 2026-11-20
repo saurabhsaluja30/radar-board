@@ -1,7 +1,7 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { CheckSquare, Square } from "lucide-react";
-import { api } from "@/lib/api";
+import { api, uploadForm } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { EXPERIENCE_RANGES, INDUSTRIES, INDUSTRIES_WITH_OTHER, INDUSTRY_SHORT, PREF_WORK_MODES } from "@/lib/constants";
 import { Button, Chip, ChipRow, Input, notify } from "@/components/kit";
@@ -90,7 +90,11 @@ export function Register() {
   const [form, setForm] = useState(EMPTY_REG);
   const [pref, setPref] = useState([]);
   const [consent, setConsent] = useState(false);
+  const [talent, setTalent] = useState(false);
+  const [resume, setResume] = useState(null);
+  const [resumeCfg, setResumeCfg] = useState(null);
   const [loading, setLoading] = useState(false);
+  useEffect(() => { api("/resume/config", { auth: false }).then(setResumeCfg).catch(() => {}); }, []);
   const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
   const bind = (k) => ({ value: form[k], onChange: (e) => set(k, e.target.value) });
   const toggle = (i) => setPref((p) => (p.includes(i) ? p.filter((x) => x !== i) : [...p, i]));
@@ -101,11 +105,22 @@ export function Register() {
       return notify("Complete Industry, Designation, Salary, Preferred Location & Work Mode", "error");
     if (form.password !== form.confirm_password) return notify("Passwords do not match", "error");
     if (!consent) return notify("Please accept the Terms & Privacy Policy", "error");
+    if (resume && !/\.(pdf|docx)$/i.test(resume.name)) return notify("Resume must be a PDF or Word (.docx) file", "error");
+    if (resume && resumeCfg && resume.size > resumeCfg.max_mb * 1024 * 1024) return notify(`Resume must be under ${resumeCfg.max_mb} MB`, "error");
     setLoading(true);
     try {
-      await register({ ...form, preferred_industries: pref, email: form.email.trim(), consent });
+      await register({ ...form, preferred_industries: pref, email: form.email.trim(), consent, talent_db_consent: talent });
       notify("Account created!", "success");
-      navigate("/");
+      // The resume uploads after the account exists, so a slow or failed upload never blocks registration.
+      if (resume) {
+        try {
+          await uploadForm("/resume/upload", resume);
+          notify("Resume uploaded — review the details on your profile", "success");
+        } catch (e) {
+          notify(`Account created, but the resume didn't upload: ${e.message}. You can upload it from your profile.`, "error");
+        }
+      }
+      navigate(resume ? "/profile" : "/");
     } catch (e) {
       notify(e.message || "Registration failed", "error");
     } finally {
@@ -157,6 +172,19 @@ export function Register() {
               onClick={() => set("preferred_experience", form.preferred_experience === e ? "" : e)} data-testid={`reg-exp-${e}`} />
           ))}
         </ChipRow>
+        {resumeCfg?.uploads_enabled ? (
+          <label className="block" data-testid="reg-resume">
+            <span className="label">Resume (optional)</span>
+            <input type="file" accept=".pdf,.docx" className="field mt-1.5" onChange={(e) => setResume(e.target.files?.[0] || null)} data-testid="reg-resume-input" />
+            <span className="mt-1 block text-xs text-gray-500">PDF or Word (.docx), up to {resumeCfg.max_mb} MB. We'll read it and let you review the details before anything is saved.</span>
+          </label>
+        ) : null}
+        <div className="flex items-start gap-3 text-sm text-gray-600">
+          <button type="button" onClick={() => setTalent((c) => !c)} data-testid="reg-talent-consent">
+            {talent ? <CheckSquare className="h-5 w-5 text-brand" /> : <Square className="h-5 w-5 text-gray-400" />}
+          </button>
+          <span>Optional: let JobRadar recruiters find my profile and resume for relevant roles. Not shared with employers without my permission; I can withdraw at any time.</span>
+        </div>
         <div className="flex items-start gap-3 text-sm text-gray-600">
           <button type="button" onClick={() => setConsent((c) => !c)} data-testid="reg-consent">
             {consent ? <CheckSquare className="h-5 w-5 text-brand" /> : <Square className="h-5 w-5 text-gray-400" />}

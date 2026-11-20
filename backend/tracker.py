@@ -9,7 +9,6 @@ from datetime import date, timedelta
 from html import escape
 from typing import Optional
 
-import requests
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -35,39 +34,7 @@ CONVERSIONS = [
 ]
 FUNNEL = ["contacted", "applied", "responded", "interview_scheduled", "interview_completed", "offer_received", "hired"]
 
-STORAGE_BASE = (os.environ.get("INTEGRATION_PROXY_URL") or "").strip() or "https://integrations.emergentagent.com"
-STORAGE_URL = STORAGE_BASE.rstrip("/") + "/objstore/api/v1/storage"
-APP_NAME = "jobradar"
-_storage = {"key": None}
-
-
-def _init_storage(force: bool = False):
-    if _storage["key"] and not force:
-        return _storage["key"]
-    resp = requests.post(f"{STORAGE_URL}/init", json={"emergent_key": os.environ.get("EMERGENT_LLM_KEY")}, timeout=30)
-    resp.raise_for_status()
-    _storage["key"] = resp.json()["storage_key"]
-    return _storage["key"]
-
-
-def _put_object(path: str, data: bytes, content_type: str) -> dict:
-    for attempt in (0, 1):
-        resp = requests.put(f"{STORAGE_URL}/objects/{path}", data=data, timeout=120,
-                            headers={"X-Storage-Key": _init_storage(force=attempt == 1), "Content-Type": content_type})
-        if resp.status_code != 404:
-            break
-    resp.raise_for_status()
-    return resp.json()
-
-
-def _get_object(path: str) -> bytes:
-    for attempt in (0, 1):
-        resp = requests.get(f"{STORAGE_URL}/objects/{path}", timeout=60,
-                            headers={"X-Storage-Key": _init_storage(force=attempt == 1)})
-        if resp.status_code != 404:
-            break
-    resp.raise_for_status()
-    return resp.content
+from storage import APP_NAME, _get_object, _put_object, warm_storage  # noqa: F401 - warm_storage is re-exported for server.py
 
 
 class TrackReq(BaseModel):
@@ -311,7 +278,8 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
         res = await db.cron_runs.update_one({"run_id": run_id}, {"$setOnInsert": {"run_id": run_id, "name": "tracker-reminders",
                                             "created_at": now_iso()}}, upsert=True)
         if res.upserted_id is not None:
-            background.add_task(send_reminder_emails)
+            from ops import tracked
+            background.add_task(tracked, "tracker-reminders", send_reminder_emails())
         return {"accepted": True}
 
     # ------------------------------------------------------------------ admin
@@ -414,11 +382,3 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
                         headers={"Content-Disposition": f'inline; filename="{e["evidence_id"]}"', "Cache-Control": "no-store"})
 
     return r
-
-
-def warm_storage(logger):
-    try:
-        _init_storage()
-    except Exception as e:
-        logger.warning(f"Storage init failed: {e}")
-

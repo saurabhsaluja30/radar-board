@@ -1,15 +1,23 @@
 import asyncio
 import csv
+import hashlib
+import hmac
 import io
+import json
+import os
 import re
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from html import escape
-from typing import List, Optional
+from typing import Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from ops import tracked
+from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
+from pymongo import ReturnDocument, UpdateOne
+from pymongo.errors import DuplicateKeyError
 
 WEIGHTS = {"skills": 30, "designation": 20, "experience": 15, "industry": 10, "location": 10, "salary": 10, "work_mode": 5}
 JOB_SOURCES = ["EevolveX recruitment assignment", "Direct employer submission", "Recruiter submission",
@@ -67,6 +75,30 @@ PROFILE_FIELDS = [
 
 
 MIN_RELEVANCE = 50
+SWEEP_INTERVAL_S = 300  # how often non-admin requests may trigger the expiry sweep
+SCORE_HISTORY_MAX = 20  # keep only the most recent score changes per match
+MY_MATCHES_TTL_S = 300  # per-candidate cache for /smartmatch/me scoring
+JOBS_CACHE_TTL_S = 60  # shared matchable-job list used by /smartmatch/me
+SCORE_CACHE_MAX = 5000  # candidates kept in the score cache
+QUEUE_BATCH = 200  # candidates scored per batch when a job is matched
+QUEUE_LOCK_MINUTES = 10
+QUEUE_MAX_ATTEMPTS = 3
+# Automatic in-app job alerts (no email, so no sending cost). Admin-adjustable in the Control Room.
+AUTO_ALERT_DEFAULTS = {"enabled": True, "min_score": 80, "max_per_day": 5, "max_job_age_days": 14}
+# Profile and job fields that change match scores. A save that touches none of them triggers no rematch.
+CANDIDATE_MATCH_FIELDS = ("primary_skills", "secondary_skills", "tools", "certifications", "current_designation", "preferred_titles",
+                          "preferred_designation", "total_experience", "relevant_experience", "industry", "preferred_industries",
+                          "industry_experience", "preferred_locations", "preferred_location", "preferred_country", "current_location",
+                          "willing_to_relocate", "expected_ctc", "expected_ctc_currency", "preferred_work_mode", "notice_period",
+                          "employment_type_pref", "profile_status", "suspended")
+JOB_MATCH_FIELDS = ("title", "designation", "required_skills", "preferred_skills", "experience_min", "experience_max",
+                    "industry_category", "function", "location", "city", "country", "work_mode", "salary_min", "salary_max",
+                    "currency", "status", "verification_status", "expiry_date", "qualifications", "mandatory_requirements",
+                    "notice_period_pref", "employment_type")
+
+
+def fields_sig(doc: dict, fields) -> str:
+    return hashlib.sha1(json.dumps([doc.get(k) for k in fields], default=str).encode()).hexdigest()
 ALERT_PREF_LABEL = {"enabled": "Job alerts on", "none": "No preference selected", "opted_out": "Opted out"}
 
 
@@ -124,6 +156,11 @@ def candidate_lists(c: dict):
     return titles, locs
 
 
+# Fields the SmartMatch analytics page reads from each candidate (profile completion + alert preference).
+ANALYTICS_USER_FIELDS = {"_id": 0, "user_id": 1, "suspended": 1, "profile_status": 1, "job_alert_consent": 1,
+                         "preferred_designation": 1, "preferred_location": 1, **{k: 1 for k, _ in PROFILE_FIELDS}}
+
+
 def profile_status(c: dict) -> dict:
     titles, locs = candidate_lists(c)
     present = {"preferred_titles": titles, "preferred_locations": locs}
@@ -136,13 +173,18 @@ def profile_status(c: dict) -> dict:
     return {"completion": pct, "missing": missing}
 
 
-def score_match(c: dict, j: dict, related_industries: list) -> dict:
+def score_match(c: dict, j: dict, related_industries: list, weights: Optional[dict] = None) -> dict:
+    """Score a candidate against a job. Components are computed on the default WEIGHTS scale and then rescaled
+    to `weights` (admin-configured, summing to 100) so the scoring rules stay in one place."""
     comps, reasons, missing_data, flags = {}, [], [], []
-    have = {norm_skill(s) for s in split_list(c.get("primary_skills")) + split_list(c.get("secondary_skills"))}
+    # Skills include tools and certifications confirmed from the candidate's resume.
+    have = {norm_skill(s) for s in split_list(c.get("primary_skills")) + split_list(c.get("secondary_skills"))
+            + split_list(c.get("tools")) + split_list(c.get("certifications"))}
     mand = [norm_skill(s) for s in split_list(j.get("required_skills"))]
     pref = [norm_skill(s) for s in split_list(j.get("preferred_skills"))]
     miss_m = [s for s in mand if not skill_hit(s, have)]
     miss_p = [s for s in pref if not skill_hit(s, have)]
+    matched = [x for x in mand + pref if x not in miss_m + miss_p] if have else []
     # Skills
     if not mand and not pref:
         comps["skills"] = {"score": 0, "assessed": False, "detail": "Job lists no skills"}
@@ -157,7 +199,6 @@ def score_match(c: dict, j: dict, related_industries: list) -> dict:
         s = round(WEIGHTS["skills"] * ratio, 1)
         comps["skills"] = {"score": s, "assessed": True,
                            "detail": f"{len(mand) - len(miss_m)}/{len(mand)} mandatory, {len(pref) - len(miss_p)}/{len(pref)} preferred skills"}
-        matched = [x for x in mand + pref if x not in miss_m + miss_p]
         if matched:
             reasons.append(f"Has {', '.join(matched[:5])}")
     if miss_m:
@@ -207,22 +248,28 @@ def score_match(c: dict, j: dict, related_industries: list) -> dict:
             s = max(0, WEIGHTS["experience"] - 3 * (exp - hi))
             flags.append(f"Above experience range ({exp:g} vs max {hi:g} yrs)")
         comps["experience"] = {"score": round(s, 1), "assessed": True, "detail": f"{exp:g} yrs vs {lo if lo is not None else '—'}–{hi if hi is not None else '—'} yrs"}
+        rel_exp = to_num(c.get("relevant_experience"))
+        if rel_exp is not None and lo is not None and rel_exp < lo <= exp:
+            flags.append(f"Relevant experience {rel_exp:g} yrs is below the {lo:g}-year minimum")
     # Industry
     ji = j.get("industry_category") or j.get("function") or ""
     prefs = [i for i in (c.get("preferred_industries") or []) if i]
     cur = c.get("industry") or ""
+    worked_in = [i for i in (c.get("industry_experience") or []) if i]
     if not ji:
         comps["industry"] = {"score": 0, "assessed": False, "detail": "Job industry not set"}
         missing_data.append("Job industry")
-    elif not prefs and not cur:
+    elif not prefs and not cur and not worked_in:
         comps["industry"] = {"score": 0, "assessed": False, "detail": "Candidate industries not provided"}
         missing_data.append("Candidate industry")
     else:
-        related = any({ji, x} == set(pair) for pair in related_industries for x in prefs + [cur] if len(pair) == 2)
+        related = any({ji, x} == set(pair) for pair in related_industries for x in prefs + [cur] + worked_in if len(pair) == 2)
         if ji in prefs:
             s, d = 10, "Preferred industry"
         elif ji == cur:
             s, d = 8, "Current industry"
+        elif ji in worked_in:
+            s, d = 8, "Industry experience (from resume)"
         elif related:
             s, d = 5, "Related industry (admin approved)"
         else:
@@ -235,13 +282,16 @@ def score_match(c: dict, j: dict, related_industries: list) -> dict:
     jloc = " ".join(x for x in [j.get("location"), j.get("city"), j.get("country")] if x).lower()
     if jm == "Remote":
         comps["location"] = {"score": 10, "assessed": True, "detail": "Remote job — location not a constraint"}
-    elif not locs and not c.get("preferred_country"):
+    elif not locs and not c.get("preferred_country") and not c.get("current_location"):
         comps["location"] = {"score": 0, "assessed": False, "detail": "Candidate preferred locations not provided"}
         missing_data.append("Candidate preferred location")
     else:
         hit = next((l for l in locs if l.lower() in jloc or (j.get("city") or "~").lower() in l.lower()), None)
+        cur_city = (c.get("current_location") or "").split(",")[0].strip().lower()
         if hit:
             s, d = 10, f"Prefers {hit}"
+        elif cur_city and cur_city in jloc:
+            s, d = 8, f"Currently based in {c['current_location']}"
         elif c.get("preferred_country") and c["preferred_country"].lower() in jloc:
             s, d = 6, f"Same preferred country ({c['preferred_country']})"
         elif c.get("willing_to_relocate"):
@@ -293,13 +343,17 @@ def score_match(c: dict, j: dict, related_industries: list) -> dict:
     et, ce = j.get("employment_type"), c.get("employment_type_pref")
     if et and ce and ce != "Any" and ce != et:
         flags.append(f"Prefers {ce}, job is {et}")
-    total = round(sum(v["score"] for v in comps.values()))
+    w = weights or WEIGHTS
     for k in comps:
-        comps[k]["max"] = WEIGHTS[k]
+        if w is not WEIGHTS:
+            comps[k]["score"] = round(comps[k]["score"] / WEIGHTS[k] * w.get(k, 0), 1) if WEIGHTS[k] else 0
+        comps[k]["max"] = w.get(k, 0)
+    total = round(sum(v["score"] for v in comps.values()))
     return {
         "match_score": total, "category": "Strong Match" if total >= 80 else "Potential Match" if total >= 65 else "Low Match",
         "components": comps, "explanation": reasons, "missing_mandatory_skills": miss_m, "missing_preferred_skills": miss_p,
         "mandatory_gap": bool(miss_m), "flags": flags, "provisional": bool(missing_data), "missing_data": missing_data,
+        "matched_skills": list(dict.fromkeys(matched))[:15],
     }
 
 
@@ -324,6 +378,17 @@ class RelatedReq(BaseModel):
     pairs: List[List[str]]
 
 
+class WeightsReq(BaseModel):
+    weights: Dict[str, int]
+
+
+class AutoAlertReq(BaseModel):
+    enabled: bool
+    min_score: int
+    max_per_day: int
+    max_job_age_days: int
+
+
 class RespondReq(BaseModel):
     job_id: str
     response: str
@@ -338,8 +403,24 @@ class VerifyJobReq(BaseModel):
     note: Optional[str] = ""
 
 
+class _LazyCards:
+    """Dict-like view that builds a job card only when it is looked up."""
+
+    def __init__(self, jobs: dict, build):
+        self._jobs, self._build = jobs, build
+
+    def __contains__(self, jid):
+        return jid in self._jobs
+
+    def __getitem__(self, jid):
+        return self._build(jid)
+
+    def get(self, jid, default=None):
+        return self._build(jid) if jid in self._jobs else default
+
+
 def build_router(db, get_current_user, require_admin, compute_membership, send_and_log_email, wrap_email,
-                 serialize_job, now_iso, audit):
+                 serialize_job, now_iso, audit, bg=None):
     r = APIRouter()
 
     def today() -> str:
@@ -358,41 +439,67 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
             return "Job has expired"
         return None
 
-    async def sweep_expired():
-        await db.jobs.update_many({"status": "Published", "expiry_date": {"$nin": [None, ""], "$lt": today()}},
-                                  {"$set": {"status": "Expired", "last_updated": now_iso()}})
+    sweep_state = {"at": 0.0}
+
+    async def sweep_expired(force: bool = False):
+        """Flip past-expiry jobs to Expired. Public reads also filter by expiry date themselves
+        (see live_job_q), so outside admin flows this only needs to run occasionally."""
+        now = time.monotonic()
+        if not force and now - sweep_state["at"] < SWEEP_INTERVAL_S:
+            return
+        sweep_state["at"] = now
+        res = await db.jobs.update_many({"status": "Published", "expiry_date": {"$nin": [None, ""], "$lt": today()}},
+                                        {"$set": {"status": "Expired", "last_updated": now_iso()}})
+        if res.modified_count:
+            jobs_cache["at"] = 0.0
 
     async def related_pairs() -> list:
         s = await db.app_settings.find_one({"key": "smartmatch"}, {"_id": 0}) or {}
         return s.get("related_industries") or []
 
+    async def weights() -> dict:
+        s = await db.app_settings.find_one({"key": "smartmatch"}, {"_id": 0, "weights": 1}) or {}
+        w = s.get("weights")
+        return w if isinstance(w, dict) and set(w) == set(WEIGHTS) else dict(WEIGHTS)
+
     def cand_eligible_q() -> dict:
         return {"role": "candidate", "suspended": {"$ne": True}, "profile_status": {"$ne": "Inactive"}}
 
-    async def upsert_match(c: dict, j: dict, res: dict) -> dict:
+    async def upsert_matches(pairs: list, existing_q: dict, min_score: Optional[int] = None) -> None:
+        """Save many (candidate, job, score) results with one read and batched writes.
+        `existing_q` selects the job_matches rows that may already exist for these pairs.
+        With `min_score`, new rows are only created for relevant scores (existing rows are always refreshed),
+        so automatic matching doesn't store a row for every low-scoring pair."""
         now = now_iso()
-        existing = await db.job_matches.find_one({"candidate_id": c["user_id"], "job_id": j["job_id"]}, {"_id": 0})
-        snap = {"job_title": j.get("title"), "company": j.get("company"), "job_location": j.get("location") or j.get("city"),
-                "job_industry": j.get("industry_category") or j.get("function"), "job_source": j.get("job_source"),
-                "candidate_name": c.get("full_name")}
-        fields = {**res, **snap, "missing_skills": res["missing_mandatory_skills"] + res["missing_preferred_skills"],
-                  "last_scored_at": now, "updated_at": now}
-        if existing:
-            upd: dict = {"$set": fields}
-            if existing.get("match_score") != res["match_score"]:
-                upd["$push"] = {"score_history": {"match_score": existing.get("match_score"), "components": existing.get("components"),
-                                                  "scored_at": existing.get("last_scored_at")}}
-            await db.job_matches.update_one({"match_id": existing["match_id"]}, upd)
-            return {**existing, **fields}
-        doc = {"match_id": f"mt_{uuid.uuid4().hex[:12]}", "candidate_id": c["user_id"], "job_id": j["job_id"], **fields,
-               "status": "suggested", "reached": {"suggested": now}, "reviewed_by": None, "reviewed_at": None,
-               "notification_status": "not_sent", "admin_comment": "", "rejection_reason": "", "score_history": [],
-               "created_at": now}
-        try:
-            await db.job_matches.insert_one(dict(doc))
-        except Exception:
-            return await db.job_matches.find_one({"candidate_id": c["user_id"], "job_id": j["job_id"]}, {"_id": 0})
-        return doc
+        existing = {(e["candidate_id"], e["job_id"]): e for e in await db.job_matches.find(
+            existing_q, {"_id": 0, "candidate_id": 1, "job_id": 1, "match_id": 1, "match_score": 1, "components": 1,
+                         "last_scored_at": 1}).to_list(None)}
+        ops = []
+        for c, j, res in pairs:
+            snap = {"job_title": j.get("title"), "company": j.get("company"), "job_location": j.get("location") or j.get("city"),
+                    "job_industry": j.get("industry_category") or j.get("function"), "job_source": j.get("job_source"),
+                    "candidate_name": c.get("full_name")}
+            fields = {**res, **snap, "missing_skills": res["missing_mandatory_skills"] + res["missing_preferred_skills"],
+                      "last_scored_at": now, "updated_at": now}
+            ex = existing.get((c["user_id"], j["job_id"]))
+            if ex:
+                upd: dict = {"$set": fields}
+                if ex.get("match_score") != res["match_score"]:
+                    upd["$push"] = {"score_history": {"$each": [{"match_score": ex.get("match_score"), "components": ex.get("components"),
+                                                                 "scored_at": ex.get("last_scored_at")}],
+                                                      "$slice": -SCORE_HISTORY_MAX}}
+                ops.append(UpdateOne({"match_id": ex["match_id"]}, upd))
+            elif min_score is not None and res["match_score"] < min_score:
+                continue
+            else:
+                doc = {"match_id": f"mt_{uuid.uuid4().hex[:12]}", "candidate_id": c["user_id"], "job_id": j["job_id"], **fields,
+                       "status": "suggested", "reached": {"suggested": now}, "reviewed_by": None, "reviewed_at": None,
+                       "notification_status": "not_sent", "admin_comment": "", "rejection_reason": "", "score_history": [],
+                       "created_at": now}
+                # $setOnInsert keeps a row created concurrently by another request instead of failing.
+                ops.append(UpdateOne({"candidate_id": c["user_id"], "job_id": j["job_id"]}, {"$setOnInsert": doc}, upsert=True))
+        for i in range(0, len(ops), 1000):
+            await db.job_matches.bulk_write(ops[i:i + 1000], ordered=False)
 
     def cand_view(c: dict) -> dict:
         titles, locs = candidate_lists(c)
@@ -430,6 +537,8 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
             "last_updated": now_iso()}})
         if not res.matched_count:
             raise HTTPException(status_code=404, detail="Job not found")
+        jobs_cache["at"] = 0.0
+        await job_changed(job_id, "verification changed")
         await audit(admin, "verify_job", "job", job_id, {"verification_status": req.verification_status, "note": req.note})
         return {"ok": True}
 
@@ -456,34 +565,280 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
     # ------------------------------------------------------------------ admin: matching
     @r.post("/admin/smartmatch/jobs/{job_id}/find-candidates")
     async def find_candidates(job_id: str, admin=Depends(require_admin)):
-        await sweep_expired()
+        await sweep_expired(force=True)
         j = await db.jobs.find_one({"job_id": job_id}, {"_id": 0})
         if not j:
             raise HTTPException(status_code=404, detail="Job not found")
         why = job_ineligible_reason(j)
         if why:
             raise HTTPException(status_code=400, detail=f"{why}. Only verified, open and non-expired jobs can be matched.")
-        rel = await related_pairs()
-        cands = await db.users.find(cand_eligible_q(), {"_id": 0, "password": 0}).to_list(50000)
-        for c in cands:
-            await upsert_match(c, j, score_match(c, j, rel))
-        await audit(admin, "find_matching_candidates", "job", job_id, {"candidates_scored": len(cands)})
-        return {"scored": len(cands)}
+        n = await match_job(j, min_score=None)
+        await audit(admin, "find_matching_candidates", "job", job_id, {"candidates_scored": n})
+        return {"scored": n}
+
+    async def match_job(j: dict, min_score: Optional[int]) -> int:
+        """Score every eligible candidate for one job, in batches so memory stays flat."""
+        rel, w = await related_pairs(), await weights()
+        n, batch = 0, []
+
+        async def flush():
+            ids = [c["user_id"] for c in batch]
+            results = await asyncio.to_thread(lambda: [(c, j, score_match(c, j, rel, w)) for c in batch])
+            await upsert_matches(results, {"job_id": j["job_id"], "candidate_id": {"$in": ids}}, min_score)
+
+        async for c in db.users.find(cand_eligible_q(), {"_id": 0, "password": 0}):
+            batch.append(c)
+            if len(batch) >= QUEUE_BATCH:
+                await flush()
+                n += len(batch)
+                batch = []
+        if batch:
+            await flush()
+            n += len(batch)
+        await db.jobs.update_one({"job_id": j["job_id"]}, {"$set": {"last_matched_at": now_iso()}})
+        return n
+
+    async def match_candidate(c: dict, min_score: Optional[int]) -> int:
+        rel, w = await related_pairs(), await weights()
+        jobs = await db.jobs.find(eligible_q(), {"_id": 0}).to_list(5000)
+        results = await asyncio.to_thread(lambda: [(c, j, score_match(c, j, rel, w)) for j in jobs])
+        await upsert_matches(results, {"candidate_id": c["user_id"]}, min_score)
+        await db.users.update_one({"user_id": c["user_id"]}, {"$set": {"last_matched_at": now_iso()}})
+        return len(jobs)
+
 
     @r.post("/admin/smartmatch/candidates/{candidate_id}/find-jobs")
     async def find_jobs(candidate_id: str, admin=Depends(require_admin)):
-        await sweep_expired()
+        await sweep_expired(force=True)
         c = await db.users.find_one({"user_id": candidate_id, "role": "candidate"}, {"_id": 0, "password": 0})
         if not c:
             raise HTTPException(status_code=404, detail="Candidate not found")
         if c.get("suspended") or c.get("profile_status") == "Inactive":
             raise HTTPException(status_code=400, detail="Candidate is suspended or inactive")
-        rel = await related_pairs()
-        jobs = await db.jobs.find(eligible_q(), {"_id": 0}).to_list(5000)
-        for j in jobs:
-            await upsert_match(c, j, score_match(c, j, rel))
-        await audit(admin, "find_matching_jobs", "candidate", candidate_id, {"jobs_scored": len(jobs)})
-        return {"scored": len(jobs)}
+        n = await match_candidate(c, min_score=None)
+        await audit(admin, "find_matching_jobs", "candidate", candidate_id, {"jobs_scored": n})
+        return {"scored": n}
+
+    # ------------------------------------------------------------------ automatic matching queue
+    # Matching runs when a job becomes matchable or a candidate's match-relevant details change, never on page visits.
+    # Each change becomes one queue item; repeated changes before it runs coalesce into that item. An atomic claim
+    # with a lock means only one replica processes an item, and a crashed replica's item is retried after the lock expires.
+    queue_gate = asyncio.Semaphore(1)
+
+    async def enqueue(kind: str, ref_id: str, reason: str):
+        try:
+            await db.match_queue.update_one(
+                {"kind": kind, "ref_id": ref_id, "status": "queued"},
+                {"$setOnInsert": {"queue_id": f"mq_{uuid.uuid4().hex[:12]}", "kind": kind, "ref_id": ref_id, "status": "queued",
+                                  "attempts": 0, "lock_until": None, "created_at": now_iso()},
+                 "$addToSet": {"reasons": reason}}, upsert=True)
+        except DuplicateKeyError:
+            pass  # another request queued the same item at the same moment
+        if bg:
+            bg(drain_queue(20))
+
+    async def claim_queue_item() -> Optional[dict]:
+        now = datetime.now(timezone.utc)
+        return await db.match_queue.find_one_and_update(
+            {"$or": [{"status": "queued"},
+                     {"status": {"$in": ["processing", "failed"]}, "attempts": {"$lt": QUEUE_MAX_ATTEMPTS}, "lock_until": {"$lt": now}}]},
+            {"$set": {"status": "processing", "lock_until": now + timedelta(minutes=QUEUE_LOCK_MINUTES), "started_at": now_iso()},
+             "$inc": {"attempts": 1}},
+            sort=[("created_at", 1)], projection={"_id": 0}, return_document=ReturnDocument.AFTER)
+
+    async def process_item(item: dict) -> dict:
+        if item["kind"] == "job":
+            j = await db.jobs.find_one({"job_id": item["ref_id"]}, {"_id": 0})
+            if not j or job_ineligible_reason(j):
+                return {"skipped": "job not matchable"}
+            n = await match_job(j, min_score=MIN_RELEVANCE)
+            return {"candidates_scored": n, "alerts": await auto_alert({"job_id": j["job_id"]})}
+        c = await db.users.find_one({"user_id": item["ref_id"], "role": "candidate"}, {"_id": 0, "password": 0})
+        if not c or c.get("suspended") or c.get("profile_status") == "Inactive":
+            return {"skipped": "candidate not matchable"}
+        n = await match_candidate(c, min_score=MIN_RELEVANCE)
+        return {"jobs_scored": n, "alerts": await auto_alert({"candidate_id": c["user_id"]})}
+
+    async def alert_settings() -> dict:
+        s = (await db.app_settings.find_one({"key": "smartmatch"}, {"_id": 0, "auto_alerts": 1}) or {}).get("auto_alerts") or {}
+        return {k: s.get(k, v) for k, v in AUTO_ALERT_DEFAULTS.items()}
+
+    async def auto_alert(scope: dict) -> dict:
+        """Create in-app alerts for relevant matches of recently published jobs.
+        Respects opt-outs and muted job categories, never alerts twice for the same job, and caps alerts per
+        candidate per day. A blank alert preference is not an opt-out: those candidates get in-app alerts too."""
+        st = await alert_settings()
+        out = {"sent": 0, "skipped": 0}
+        if not st["enabled"]:
+            return out
+        since = (datetime.now(timezone.utc) - timedelta(days=st["max_job_age_days"])).isoformat()
+        rows = await db.job_matches.find({**scope, "match_score": {"$gte": st["min_score"]}, "status": {"$ne": "rejected"}},
+                                         {"_id": 0, "match_id": 1, "candidate_id": 1, "job_id": 1, "match_score": 1,
+                                          "explanation": 1}).sort("match_score", -1).to_list(5000)
+        if not rows:
+            return out
+        jobs = {j["job_id"]: j for j in await db.jobs.find(
+            {"job_id": {"$in": list({m["job_id"] for m in rows})}, **eligible_q(),
+             "$and": [{"$or": [{"date_published": {"$gte": since}}, {"date_published": None, "date_added": {"$gte": since}}]}]},
+            {"_id": 0, "job_id": 1, "title": 1, "company": 1, "industry_category": 1, "location": 1}).to_list(None)}
+        cids = list({m["candidate_id"] for m in rows if m["job_id"] in jobs})
+        users = {u["user_id"]: u for u in await db.users.find(
+            {"user_id": {"$in": cids}, **cand_eligible_q()},
+            {"_id": 0, "user_id": 1, "job_alert_consent": 1, "alert_muted_industries": 1}).to_list(None)}
+        already = {(n["candidate_id"], n["job_id"]) for n in await db.job_notifications.find(
+            {"candidate_id": {"$in": cids}, "job_id": {"$in": list(jobs)}, "channel": "in_app"},
+            {"_id": 0, "candidate_id": 1, "job_id": 1}).to_list(None)}
+        day_ago = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        today = {d["_id"]: d["n"] for d in await db.job_notifications.aggregate([
+            {"$match": {"candidate_id": {"$in": cids}, "channel": "in_app", "source": "auto", "sent_at": {"$gte": day_ago}}},
+            {"$group": {"_id": "$candidate_id", "n": {"$sum": 1}}}]).to_list(None)}
+        now = now_iso()
+        for m in rows:
+            j, u = jobs.get(m["job_id"]), users.get(m["candidate_id"])
+            if not j or not u or (m["candidate_id"], m["job_id"]) in already:
+                continue
+            if alert_pref(u) == "opted_out" or (j.get("industry_category") and j["industry_category"] in (u.get("alert_muted_industries") or [])) \
+                    or today.get(u["user_id"], 0) >= st["max_per_day"]:
+                out["skipped"] += 1
+                continue
+            reasons = "\n".join(f"- {x}" for x in (m.get("explanation") or [])[:4]) or "- Matches your profile"
+            try:
+                await db.job_notifications.insert_one({
+                    "notification_id": f"nt_{uuid.uuid4().hex[:12]}", "candidate_id": u["user_id"], "job_id": j["job_id"],
+                    "channel": "in_app", "status": "sent", "source": "auto", "match_id": m["match_id"],
+                    "subject": f"New job match: {j.get('title')} at {j.get('company')}",
+                    "body": f"This opportunity scores {m['match_score']}% against your profile.\n\nWhy it may suit you:\n{reasons}",
+                    "sent_at": now, "read_at": None, "created_at": now, "updated_at": now, "attempts": 1})
+            except DuplicateKeyError:
+                continue  # alerted concurrently
+            await db.job_matches.update_one({"match_id": m["match_id"]}, {"$set": {"auto_notified_at": now}})
+            already.add((m["candidate_id"], m["job_id"]))
+            today[u["user_id"]] = today.get(u["user_id"], 0) + 1
+            out["sent"] += 1
+        return out
+
+    @r.get("/admin/smartmatch/auto-alerts")
+    async def get_auto_alerts(admin=Depends(require_admin)):
+        week = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        return {"settings": await alert_settings(),
+                "sent_last_7_days": await db.job_notifications.count_documents({"source": "auto", "sent_at": {"$gte": week}}),
+                "candidates_alerted_7_days": len(await db.job_notifications.distinct("candidate_id", {"source": "auto", "sent_at": {"$gte": week}}))}
+
+    @r.put("/admin/smartmatch/auto-alerts")
+    async def put_auto_alerts(req: AutoAlertReq, admin=Depends(require_admin)):
+        if not 50 <= req.min_score <= 100 or not 1 <= req.max_per_day <= 20 or not 1 <= req.max_job_age_days <= 60:
+            raise HTTPException(400, "Minimum score must be 50–100, alerts per day 1–20 and job age 1–60 days")
+        val = req.dict()
+        await db.app_settings.update_one({"key": "smartmatch"}, {"$set": {"auto_alerts": val}}, upsert=True)
+        await audit(admin, "update_auto_alerts", "settings", "smartmatch", val)
+        return {"settings": val}
+
+    async def drain_queue(limit: int):
+        async with queue_gate:
+            for _ in range(limit):
+                item = await claim_queue_item()
+                if not item:
+                    return
+                try:
+                    result = await process_item(item)
+                    await db.match_queue.update_one({"queue_id": item["queue_id"]}, {"$set": {
+                        "status": "done", "result": result, "finished_at": now_iso(), "done_at": datetime.now(timezone.utc),
+                        "lock_until": None}})
+                    jobs_cache["at"] = 0.0
+                except Exception as e:  # noqa: BLE001 - kept for retry by the cron
+                    await db.match_queue.update_one({"queue_id": item["queue_id"]}, {"$set": {
+                        "status": "failed", "error": f"{type(e).__name__}: {str(e)[:180]}", "lock_until": datetime.now(timezone.utc)}})
+
+    async def job_changed(job_id: str, reason: str = "job updated"):
+        """Queue matching when a job is (still) matchable and something that affects scores changed."""
+        j = await db.jobs.find_one({"job_id": job_id}, {"_id": 0, **{k: 1 for k in JOB_MATCH_FIELDS}, "match_sig": 1, "job_id": 1})
+        if not j or job_ineligible_reason(j):
+            return False
+        sig = fields_sig(j, JOB_MATCH_FIELDS)
+        if sig == j.get("match_sig"):
+            return False
+        await db.jobs.update_one({"job_id": job_id}, {"$set": {"match_sig": sig}})
+        await enqueue("job", job_id, reason)
+        return True
+
+    async def candidate_changed(user_id: str, reason: str = "profile updated"):
+        u = await db.users.find_one({"user_id": user_id, "role": "candidate"},
+                                    {"_id": 0, **{k: 1 for k in CANDIDATE_MATCH_FIELDS}, "match_sig": 1})
+        if not u or u.get("suspended") or u.get("profile_status") == "Inactive":
+            return False
+        sig = fields_sig(u, CANDIDATE_MATCH_FIELDS)
+        if sig == u.get("match_sig"):
+            return False
+        await db.users.update_one({"user_id": user_id}, {"$set": {"match_sig": sig}})
+        await enqueue("candidate", user_id, reason)
+        return True
+
+    @r.post("/cron/smartmatch-queue")
+    async def cron_queue(authorization: Optional[str] = Header(None)):
+        secret = os.environ.get("WEBHOOK_CRON_SECRET") or ""
+        token = authorization[7:] if authorization and authorization.startswith("Bearer ") else ""
+        if not secret or not hmac.compare_digest(token, secret):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        if bg:
+            bg(tracked("smartmatch-queue", drain_queue(50)))
+        return {"accepted": True}
+
+    @r.get("/admin/smartmatch/weights")
+    async def get_weights(admin=Depends(require_admin)):
+        return {"weights": await weights(), "defaults": WEIGHTS}
+
+    @r.put("/admin/smartmatch/weights")
+    async def put_weights(req: WeightsReq, admin=Depends(require_admin)):
+        w = req.weights
+        if set(w) != set(WEIGHTS) or any(not isinstance(v, int) or v < 0 for v in w.values()):
+            raise HTTPException(400, f"Provide a whole-number weight for each of: {', '.join(WEIGHTS)}")
+        if sum(w.values()) != 100:
+            raise HTTPException(400, f"Weights must add up to 100 (they add up to {sum(w.values())})")
+        await db.app_settings.update_one({"key": "smartmatch"}, {"$set": {"weights": w}}, upsert=True)
+        jobs_cache["at"] = 0.0
+        await audit(admin, "update_match_weights", "settings", "smartmatch", w)
+        return {"weights": w}
+
+    @r.post("/admin/smartmatch/rescore-all")
+    async def rescore_all(admin=Depends(require_admin)):
+        """Queue every open job for rescoring (e.g. after changing weights). Runs in the background in batches."""
+        await sweep_expired(force=True)
+        ids = await db.jobs.distinct("job_id", eligible_q())
+        for jid in ids:
+            await enqueue("job", jid, "admin rescore")
+        await audit(admin, "rescore_all_matches", "settings", "smartmatch", {"jobs": len(ids)})
+        return {"queued_jobs": len(ids)}
+
+    @r.get("/admin/smartmatch/control-room")
+    async def control_room(admin=Depends(require_admin)):
+        await sweep_expired()
+        job_ids = await db.jobs.distinct("job_id", eligible_q())
+        cand_ids = set(await db.users.distinct("user_id", cand_eligible_q()))
+        live = {"job_id": {"$in": job_ids}}
+        by_band = {d["_id"]: d["n"] for d in await db.job_matches.aggregate([
+            {"$match": {**live, "match_score": {"$gte": 65}}},
+            {"$group": {"_id": {"$cond": [{"$gte": ["$match_score", 80]}, "strong", "potential"]}, "n": {"$sum": 1}}}]).to_list(None)}
+        jobs_with = set(await db.job_matches.distinct("job_id", {**live, "match_score": {"$gte": 65}, "candidate_id": {"$in": list(cand_ids)}}))
+        cands_with = set(await db.job_matches.distinct("candidate_id", {**live, "match_score": {"$gte": 65}}))
+        lonely = [j for j in job_ids if j not in jobs_with]
+        lonely_jobs = await db.jobs.find({"job_id": {"$in": lonely[:10]}}, {"_id": 0, "job_id": 1, "title": 1, "company": 1,
+                                                                           "last_matched_at": 1}).to_list(10)
+        queue = {d["_id"]: d["n"] for d in await db.match_queue.aggregate([{"$group": {"_id": "$status", "n": {"$sum": 1}}}]).to_list(None)}
+        last = await db.match_queue.find_one({"status": "done"}, {"_id": 0, "finished_at": 1}, sort=[("finished_at", -1)])
+        return {
+            "total_candidates": await db.users.count_documents({"role": "candidate"}),
+            "candidates_with_resumes": await db.users.count_documents({"role": "candidate", "has_resume": True}),
+            "active_jobs": len(job_ids),
+            "strong_matches": by_band.get("strong", 0), "potential_matches": by_band.get("potential", 0),
+            "awaiting_review": await db.job_matches.count_documents({**live, "status": {"$in": ["suggested", "pending_review"]},
+                                                                     "match_score": {"$gte": 65}}),
+            "approved": await db.job_matches.count_documents({**live, "status": "approved"}),
+            "contacted": await db.job_matches.count_documents({**live, "contacted_at": {"$ne": None}}),
+            "shortlisted": await db.job_matches.count_documents({**live, "shortlisted_at": {"$ne": None}}),
+            "jobs_without_suitable": len(lonely), "jobs_without_suitable_list": lonely_jobs,
+            "candidates_without_suitable": len(cand_ids - cands_with),
+            "queue": queue, "last_processed_at": (last or {}).get("finished_at"), "weights": await weights(),
+        }
 
     async def match_query(f: dict) -> dict:
         q: dict = {}
@@ -647,7 +1002,8 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
 
     @r.post("/admin/smartmatch/matches/review")
     async def review(req: ReviewReq, admin=Depends(require_admin)):
-        actions = {"approve": "approved", "reject": "rejected", "pending_review": "pending_review", "close": "closed", "comment": None}
+        actions = {"approve": "approved", "reject": "rejected", "pending_review": "pending_review", "close": "closed", "comment": None,
+                   "mark_contacted": None, "unmark_contacted": None, "mark_shortlisted": None, "unmark_shortlisted": None}
         if req.action not in actions:
             raise HTTPException(status_code=400, detail="Invalid action")
         if req.action == "reject" and not (req.rejection_reason or "").strip():
@@ -659,6 +1015,15 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
             m = await db.job_matches.find_one({"match_id": mid}, {"_id": 0})
             if not m:
                 skipped.append({"match_id": mid, "reason": "not found"})
+                continue
+            if req.action.startswith(("mark_", "unmark_")):
+                # Internal recruiter tracking; it doesn't change the match's review status or notify the candidate.
+                tag = req.action.split("_", 1)[1]
+                on = req.action.startswith("mark_")
+                await db.job_matches.update_one({"match_id": mid}, {"$set": {
+                    f"{tag}_at": now_iso() if on else None, f"{tag}_by": admin["user_id"] if on else None, "updated_at": now_iso()}})
+                await audit(admin, req.action + "_match", "job_match", mid, {})
+                done += 1
                 continue
             if req.action == "comment":
                 await db.job_matches.update_one({"match_id": mid}, {"$set": {"admin_comment": req.comment or "", "updated_at": now_iso()}})
@@ -756,7 +1121,9 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
                                     "reason": "email needs the candidate's opt-in — no preference selected, in-app only"})
                     continue
                 prev = await db.job_notifications.find_one({"candidate_id": c["user_id"], "job_id": j["job_id"], "channel": ch}, {"_id": 0})
-                if prev and prev["status"] == "sent":
+                # An automatic alert doesn't block an admin share: the share upgrades it (same notification, no duplicate).
+                upgrading = bool(prev and prev["status"] == "sent" and prev.get("source") == "auto")
+                if prev and prev["status"] == "sent" and not upgrading:
                     results.append({"match_id": mid, "channel": ch, "result": "skipped", "reason": "already sent"})
                     continue
                 if ch == "email" and FREQ_DAYS.get(c.get("job_alert_frequency")):
@@ -781,9 +1148,11 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
                 now = now_iso()
                 await db.job_notifications.update_one(
                     {"candidate_id": c["user_id"], "job_id": j["job_id"], "channel": ch},
-                    {"$set": {"match_id": mid, "status": status, "error": error, "subject": subject, "body": body,
-                              "sent_by": admin["user_id"], "sent_at": now if status == "sent" else None, "updated_at": now},
-                     "$setOnInsert": {"notification_id": f"nt_{uuid.uuid4().hex[:12]}", "read_at": None, "created_at": now},
+                    {"$set": {"match_id": mid, "status": status, "error": error, "subject": subject, "body": body, "source": "admin",
+                              "sent_by": admin["user_id"], "sent_at": now if status == "sent" else None, "updated_at": now,
+                              **({"read_at": None} if upgrading else {})},
+                     "$setOnInsert": {"notification_id": f"nt_{uuid.uuid4().hex[:12]}", "created_at": now,
+                                      **({} if upgrading else {"read_at": None})},
                      "$inc": {"attempts": 1}}, upsert=True)
                 results.append({"match_id": mid, "channel": ch, "result": status, "reason": error})
                 any_sent = any_sent or status == "sent"
@@ -854,7 +1223,7 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
     @r.get("/admin/smartmatch/analytics")
     async def analytics(admin=Depends(require_admin), start: str = "", end: str = "", industry: str = "", source: str = "",
                         location: str = "", designation: str = ""):
-        await sweep_expired()
+        await sweep_expired(force=True)
         from tracker import _range
         rng = _range(start or None, end or None)
         jq: dict = {}
@@ -881,20 +1250,26 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
         nq: dict = {"job_id": {"$in": job_ids}}
         if rng:
             nq["created_at"] = rng
-        notes = await db.job_notifications.find(nq, {"_id": 0, "status": 1, "channel": 1}).to_list(100000)
+        # Count notifications on the database: one row per (status, channel) instead of every notification.
+        notes = [{"status": d["_id"]["status"], "channel": d["_id"]["channel"], "n": d["n"]}
+                 for d in await db.job_notifications.aggregate([
+                     {"$match": nq}, {"$group": {"_id": {"status": "$status", "channel": "$channel"}, "n": {"$sum": 1}}}]).to_list(None)]
         pairs = {(m["candidate_id"], m["job_id"]) for m in matches}
         trk = [t for t in await db.job_tracker.find({"job_id": {"$in": job_ids}, "archived": {"$ne": True}},
                                                      {"_id": 0, "candidate_id": 1, "job_id": 1, "reached": 1, "interview_verification": 1,
                                                       "hire_verification": 1}).to_list(100000)
                if (t["candidate_id"], t["job_id"]) in pairs]
-        users = await db.users.find({"role": "candidate"}, {"_id": 0, "password": 0}).to_list(50000)
+        users = await db.users.find({"role": "candidate"}, ANALYTICS_USER_FIELDS).to_list(50000)
         approved, shared = reached("approved"), reached("shared")
         reviewed = [m for m in matches if {"approved", "rejected"} & set((m.get("reached") or {}))]
         responded = [m for m in shared if {"interested", "not_interested", "applied"} & set(m.get("reached") or {})]
         interested = [m for m in shared if {"interested", "applied"} & set(m.get("reached") or {})]
         applied, interviews = reached("applied"), reached("interview_reported")
-        sent = [n for n in notes if n["status"] == "sent"]
-        attempted = [n for n in notes if n["status"] in ("sent", "failed")]
+        n_sent = sum(n["n"] for n in notes if n["status"] == "sent")
+        n_attempted = sum(n["n"] for n in notes if n["status"] in ("sent", "failed"))
+        n_failed = sum(n["n"] for n in notes if n["status"] == "failed")
+        n_email = sum(n["n"] for n in notes if n["status"] == "sent" and n["channel"] == "email")
+        n_in_app = sum(n["n"] for n in notes if n["status"] == "sent" and n["channel"] == "in_app")
         pct = lambda a, b: round(len(a) * 100 / len(b), 1) if b else None  # noqa: E731
         return {
             "candidates": {"total": len(users), "active": sum(1 for u in users if not u.get("suspended") and u.get("profile_status") != "Inactive"),
@@ -914,7 +1289,7 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
                 {"label": "Candidate Job Delivery Rate", "value": pct(shared, approved), "explain": "Shared ÷ approved matches"},
                 {"label": "Match Approval Rate", "value": pct(approved, reviewed), "explain": "Approved ÷ reviewed (approved + rejected) matches"},
                 {"label": "Candidate Interest Rate", "value": pct(interested, shared), "explain": "Interested or applied ÷ shared matches"},
-                {"label": "Job Alert Delivery Rate", "value": pct(sent, attempted), "explain": "Delivered ÷ attempted alerts (in-app + email)"},
+                {"label": "Job Alert Delivery Rate", "value": round(n_sent * 100 / n_attempted, 1) if n_attempted else None, "explain": "Delivered ÷ attempted alerts (in-app + email)"},
                 {"label": "Independently Reported Application Rate", "value": pct([m for m in applied if "shared" in (m.get("reached") or {})], shared),
                  "explain": "Shared matches where the candidate reported applying ÷ shared matches"},
                 {"label": "Interview Reporting Rate", "value": pct([m for m in interviews if "applied" in (m.get("reached") or {})], applied),
@@ -926,10 +1301,9 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
                 "enabled": sum(1 for u in users if alert_pref(u) == "enabled"), "none": sum(1 for u in users if alert_pref(u) == "none"),
                 "opted_out": sum(1 for u in users if alert_pref(u) == "opted_out"),
                 "eligible_in_app": sum(1 for u in users if alert_pref(u) != "opted_out" and not u.get("suspended") and u.get("profile_status") != "Inactive"),
-                "notifications_sent": len(attempted), "notifications_delivered": len(sent),
-                "notifications_failed": sum(1 for n in notes if n["status"] == "failed"), "candidate_responses": len(responded)},
-            "alerts": {"sent": len(sent), "failed": sum(1 for n in notes if n["status"] == "failed"),
-                       "email_sent": sum(1 for n in sent if n["channel"] == "email"), "in_app_sent": sum(1 for n in sent if n["channel"] == "in_app")},
+                "notifications_sent": n_attempted, "notifications_delivered": n_sent,
+                "notifications_failed": n_failed, "candidate_responses": len(responded)},
+            "alerts": {"sent": n_sent, "failed": n_failed, "email_sent": n_email, "in_app_sent": n_in_app},
         }
 
     # ------------------------------------------------------------------ candidate
@@ -1020,6 +1394,40 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
                                              "granted": False, "source": "delete_smartmatch_data", "at": now_iso()})
         return {"ok": True}
 
+    # Shared list of matchable jobs (same for every candidate) and per-candidate score cache, so the
+    # My Matches page doesn't refetch and rescore every job on every visit.
+    jobs_cache: dict = {"at": 0.0, "jobs": {}}
+    jobs_lock = asyncio.Lock()
+    score_cache: Dict[str, tuple] = {}
+    MATCH_KEYS = ("match_score", "category", "explanation", "missing_mandatory_skills", "provisional", "missing_data", "flags",
+                  "matched_skills")
+
+    async def eligible_jobs() -> tuple:
+        async with jobs_lock:
+            if time.monotonic() - jobs_cache["at"] > JOBS_CACHE_TTL_S:
+                docs = await db.jobs.find(eligible_q(), {"_id": 0, "admin_notes": 0, "verification_score": 0}).to_list(5000)
+                jobs_cache["jobs"] = {j["job_id"]: j for j in docs}
+                jobs_cache["at"] = time.monotonic()
+            return jobs_cache["at"], jobs_cache["jobs"]
+
+    async def my_scores(user: dict, rel: list) -> tuple:
+        version, jobs = await eligible_jobs()
+        w = await weights()
+        sig = hashlib.sha1(json.dumps([user, rel, w], sort_keys=True, default=str).encode()).hexdigest()
+        hit = score_cache.get(user["user_id"])
+        if hit and hit[0] == sig and hit[1] == version and time.monotonic() - hit[2] < MY_MATCHES_TTL_S:
+            return jobs, hit[3]
+
+        def run():
+            return {jid: {k: res[k] for k in MATCH_KEYS} for jid, res in
+                    ((jid, score_match(user, j, rel, w)) for jid, j in jobs.items())}
+
+        scores = await asyncio.to_thread(run)
+        if len(score_cache) >= SCORE_CACHE_MAX:
+            score_cache.pop(next(iter(score_cache)))
+        score_cache[user["user_id"]] = (sig, version, time.monotonic(), scores)
+        return jobs, scores
+
     @r.get("/smartmatch/me")
     async def my_matches(user=Depends(get_current_user)):
         if user.get("role") != "candidate":
@@ -1029,24 +1437,36 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
         m = await compute_membership(uid)
         is_member = m["is_active"]
         rel = await related_pairs()
-        jobs = await db.jobs.find(eligible_q(), {"_id": 0, "admin_notes": 0, "verification_score": 0}).to_list(5000)
+        jobs, scores = await my_scores(user, rel)
         saved_ids = {s["job_id"] for s in await db.saved_jobs.find({"candidate_id": uid}, {"_id": 0, "job_id": 1}).to_list(1000)}
         not_int = set(await db.job_matches.distinct("job_id", {"candidate_id": uid, "status": "not_interested"}))
         not_int |= set(await db.candidate_job_activity.distinct("job_id", {"candidate_id": uid, "type": "not_interested"}))
         tracked = {t["job_id"]: t["status"] for t in await db.job_tracker.find({"candidate_id": uid, "archived": {"$ne": True}},
                                                                                {"_id": 0, "job_id": 1, "status": 1}).to_list(1000)}
 
-        def card(j):
-            res = score_match(user, j, rel)
-            return {**serialize_job(j, is_member, j["job_id"] in saved_ids), "match": {
-                k: res[k] for k in ("match_score", "category", "explanation", "missing_mandatory_skills", "provisional", "missing_data", "flags")},
-                "tracked_status": tracked.get(j["job_id"]), "not_interested": j["job_id"] in not_int}
+        # Jobs may have expired since the shared job list was cached.
+        jobs = {jid: j for jid, j in jobs.items() if not job_ineligible_reason(j)}
+        built: dict = {}
 
-        cards = {j["job_id"]: card(j) for j in jobs}
-        ranked = sorted((c for c in cards.values() if not c["not_interested"]), key=lambda c: -c["match"]["match_score"])
+        def card(jid):
+            # Only jobs that actually appear in the response are serialised.
+            if jid not in built:
+                j, res = jobs[jid], scores[jid]
+                built[jid] = {**serialize_job(j, is_member, jid in saved_ids), "match": dict(res),
+                              "tracked_status": tracked.get(jid), "not_interested": jid in not_int}
+            return built[jid]
+
+        cards = _LazyCards(jobs, card)
+        ranked_ids = sorted((jid for jid in jobs if jid not in not_int), key=lambda jid: -scores[jid]["match_score"])
         recent_cut = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-        recent = sorted([c for c in cards.values() if (c.get("date_published") or c.get("date_added") or "") >= recent_cut],
-                        key=lambda c: c.get("date_published") or c.get("date_added") or "", reverse=True)
+
+        def pub(jid):
+            j = jobs[jid]
+            return j.get("date_published") or j.get("date_added") or ""
+
+        recent = [card(jid) for jid in sorted((jid for jid in jobs if pub(jid) >= recent_cut), key=pub, reverse=True)[:12]]
+        ranked = [card(jid) for jid in [x for x in ranked_ids if scores[x]["match_score"] >= 65][:12]]
+        strong = [card(jid) for jid in [x for x in ranked_ids if scores[x]["match_score"] >= 80][:12]]
         viewed_ids, seen = [], set()
         for a in await db.candidate_job_activity.find({"candidate_id": uid, "type": "view"}, {"_id": 0, "job_id": 1}).sort("at", -1).to_list(200):
             if a["job_id"] not in seen:
@@ -1061,11 +1481,15 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
                 shared.append({**c, "notification": {k: n.get(k) for k in ("notification_id", "subject", "body", "sent_at", "read_at")}})
         return {
             "profile": profile_status(user), "alerts": {"consent": user.get("job_alert_consent") is True, "pref": alert_pref(user), "frequency": user.get("job_alert_frequency") or "Instant"},
-            "recommended": [c for c in ranked if c["match"]["match_score"] >= 65][:12],
-            "strong": [c for c in ranked if c["match"]["match_score"] >= 80][:12],
-            "recent": recent[:12], "saved": [cards[i] for i in saved_ids if i in cards],
+            "recommended": ranked,
+            "strong": strong,
+            "recent": recent, "saved": [cards[i] for i in saved_ids if i in cards],
             "viewed": [cards[i] for i in viewed_ids if i in cards][:12], "shared": shared,
             "unread": sum(1 for n in notes if not n.get("read_at")),
         }
 
-    return r, {"sweep_expired": sweep_expired, "on_tracker_status": on_tracker_status}
+    def invalidate_jobs():
+        jobs_cache["at"] = 0.0
+
+    return r, {"sweep_expired": sweep_expired, "on_tracker_status": on_tracker_status, "invalidate_jobs": invalidate_jobs,
+               "job_changed": job_changed, "candidate_changed": candidate_changed}

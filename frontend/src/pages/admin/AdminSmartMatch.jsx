@@ -4,7 +4,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Briefcase, ClipboardCheck, Megaphone, Search, Users } from "lucide-react";
 import { api } from "@/lib/api";
 import { formatDate, INDUSTRIES, INDUSTRY_SHORT, JOB_SOURCES, JOB_STATUS_LABEL, JOB_STATUSES, MATCH_STATUS_LABEL, NOTICE_PERIODS, PREF_WORK_MODES, WORK_MODES } from "@/lib/constants";
-import { Badge, Button, Card, Chip, EmptyState, errMsg, Input, notify, PageHeader, Spinner } from "@/components/kit";
+import { Badge, Button, Card, Chip, EmptyState, errMsg, Input, notify, PageHeader, Spinner, Switch } from "@/components/kit";
 import { MatchTable } from "@/components/MatchTable";
 
 const clean = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== "" && v !== "All" && v != null));
@@ -20,6 +20,131 @@ const Chips = ({ label, value, options, onChange, testId, short }) => (
 
 const SmallInput = (props) => <Input {...props} className="min-w-0" />;
 
+const WEIGHT_LABEL = { skills: "Skills", designation: "Designation", experience: "Experience", industry: "Industry",
+  location: "Location", salary: "Salary", work_mode: "Work mode" };
+
+function WeightsCard({ onSaved }) {
+  const { data, refetch } = useQuery({ queryKey: ["sm-weights"], queryFn: () => api("/admin/smartmatch/weights") });
+  const [w, setW] = useState(null);
+  const [busy, setBusy] = useState("");
+  useEffect(() => { if (data) setW(Object.fromEntries(Object.entries(data.weights).map(([k, v]) => [k, String(v)]))); }, [data]);
+  if (!w) return null;
+  const total = Object.values(w).reduce((a, v) => a + (Number(v) || 0), 0);
+  const save = async () => {
+    setBusy("save");
+    try {
+      await api("/admin/smartmatch/weights", { method: "PUT", body: { weights: Object.fromEntries(Object.entries(w).map(([k, v]) => [k, Number(v) || 0])) } });
+      await refetch();
+      notify("Weights saved. Candidates' My Matches pages use them now; rescore to update stored matches.", "success");
+      onSaved?.();
+    } catch (e) {
+      notify(errMsg(e), "error");
+    } finally {
+      setBusy("");
+    }
+  };
+  const rescore = async () => {
+    setBusy("rescore");
+    try {
+      const res = await api("/admin/smartmatch/rescore-all", { method: "POST" });
+      notify(`${res.queued_jobs} open jobs queued for rescoring`, "success");
+      onSaved?.();
+    } catch (e) {
+      notify(errMsg(e), "error");
+    } finally {
+      setBusy("");
+    }
+  };
+  return (
+    <Card className="space-y-4" data-testid="sm-weights">
+      <div className="flex items-center justify-between"><p className="h-sec">Matching weights</p>
+        <span className={`text-sm font-bold ${total === 100 ? "text-emerald-700" : "text-red-600"}`} data-testid="sm-weights-total">Total {total}/100</span></div>
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 2xl:grid-cols-4">
+        {Object.keys(WEIGHT_LABEL).map((k) => (
+          <Input key={k} label={WEIGHT_LABEL[k]} inputMode="numeric" value={w[k]} onChange={(e) => setW((x) => ({ ...x, [k]: e.target.value.replace(/\D/g, "") }))} data-testid={`sm-weight-${k}`} />
+        ))}
+      </div>
+      <p className="text-xs text-gray-500">Defaults: {Object.entries(data.defaults).map(([k, v]) => `${WEIGHT_LABEL[k]} ${v}`).join(" · ")}. Scores are advisory; missing information never counts as a match.</p>
+      <div className="flex flex-wrap gap-2">
+        <Button title="Save weights" loading={busy === "save"} disabled={total !== 100} onClick={save} data-testid="sm-weights-save" />
+        <Button variant="outline" title="Rescore all open jobs" loading={busy === "rescore"} onClick={rescore} data-testid="sm-rescore" />
+      </div>
+    </Card>
+  );
+}
+
+function AutoAlertsCard() {
+  const { data, refetch } = useQuery({ queryKey: ["sm-auto-alerts"], queryFn: () => api("/admin/smartmatch/auto-alerts") });
+  const [s, setS] = useState(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => { if (data) setS(Object.fromEntries(Object.entries(data.settings).map(([k, v]) => [k, typeof v === "boolean" ? v : String(v)]))); }, [data]);
+  if (!s) return null;
+  const save = async () => {
+    setBusy(true);
+    try {
+      await api("/admin/smartmatch/auto-alerts", { method: "PUT", body: { enabled: s.enabled, min_score: Number(s.min_score), max_per_day: Number(s.max_per_day), max_job_age_days: Number(s.max_job_age_days) } });
+      await refetch();
+      notify("Job alert settings saved", "success");
+    } catch (e) {
+      notify(errMsg(e), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const set = (k) => (e) => setS((x) => ({ ...x, [k]: e.target.value.replace(/\D/g, "") }));
+  return (
+    <Card className="space-y-4" data-testid="sm-auto-alerts">
+      <div className="flex items-center justify-between"><p className="h-sec">Automatic in-app job alerts</p>
+        <Switch checked={s.enabled} onChange={(v) => setS((x) => ({ ...x, enabled: v }))} data-testid="sm-auto-alerts-switch" /></div>
+      <p className="text-sm text-gray-600">{data.sent_last_7_days} alerts to {data.candidates_alerted_7_days} candidates in the last 7 days. In-app only — no email cost.</p>
+      <div className="grid grid-cols-3 gap-3">
+        <Input label="Minimum score" inputMode="numeric" value={s.min_score} onChange={set("min_score")} data-testid="sm-auto-min" />
+        <Input label="Max alerts / candidate / day" inputMode="numeric" value={s.max_per_day} onChange={set("max_per_day")} />
+        <Input label="Only jobs published in last (days)" inputMode="numeric" value={s.max_job_age_days} onChange={set("max_job_age_days")} />
+      </div>
+      <p className="text-xs text-gray-500">Sent when a new job is matched or a candidate's profile changes. Candidates who opted out or muted the job's category are skipped; candidates who haven't chosen a preference still get in-app alerts. Never more than one alert per job.</p>
+      <Button title="Save alert settings" loading={busy} onClick={save} data-testid="sm-auto-save" />
+    </Card>
+  );
+}
+
+function ControlRoom() {
+  const navigate = useNavigate();
+  const { data, refetch } = useQuery({ queryKey: ["sm-control-room"], queryFn: () => api("/admin/smartmatch/control-room"), refetchInterval: 30000 });
+  if (!data) return <Spinner />;
+  const q = data.queue || {};
+  const tiles = [
+    ["Registered candidates", data.total_candidates], ["Candidates with resumes", data.candidates_with_resumes], ["Active approved jobs", data.active_jobs],
+    ["Strong matches (80+)", data.strong_matches], ["Potential matches (65–79)", data.potential_matches], ["Awaiting review", data.awaiting_review],
+    ["Approved by admin", data.approved], ["Contacted / shortlisted", `${data.contacted} / ${data.shortlisted}`],
+    ["Jobs without suitable candidates", data.jobs_without_suitable], ["Candidates without suitable jobs", data.candidates_without_suitable],
+  ];
+  return (
+    <div className="mb-8 space-y-6" data-testid="sm-control-room">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
+        {tiles.map(([l, v]) => (
+          <div key={l} className="rounded-xl bg-brand-mist p-4"><p className="text-2xl font-extrabold text-brand">{v}</p><p className="text-xs font-semibold text-gray-500">{l}</p></div>
+        ))}
+      </div>
+      <p className="text-xs text-gray-500" data-testid="sm-queue">Automatic matching: {q.queued || 0} queued · {q.processing || 0} running · {q.failed || 0} failed
+        {data.last_processed_at ? ` · last run ${formatDate(data.last_processed_at)}` : ""}. Newly published jobs and updated candidate profiles are matched automatically in the background.</p>
+      <div className="grid gap-6 lg:grid-cols-2">
+        <WeightsCard onSaved={refetch} />
+        <AutoAlertsCard />
+        <Card className="space-y-2" data-testid="sm-lonely-jobs">
+          <p className="h-sec">Jobs without suitable candidates</p>
+          {!data.jobs_without_suitable_list.length ? <p className="text-sm text-gray-500">Every open job has at least one candidate scoring 65+.</p>
+            : data.jobs_without_suitable_list.map((j) => (
+              <button key={j.job_id} onClick={() => navigate(`/admin/smartmatch/job/${j.job_id}`)} className="block w-full rounded-lg p-2 text-left text-sm hover:bg-brand-mist">
+                <b>{j.title}</b> · {j.company}<span className="block text-xs text-gray-500">{j.last_matched_at ? `Last matched ${formatDate(j.last_matched_at)}` : "Not matched yet"}</span>
+              </button>
+            ))}
+        </Card>
+      </div>
+    </div>
+  );
+}
+
 export function SmartMatchHome() {
   const navigate = useNavigate();
   const { data } = useQuery({ queryKey: ["sm-analytics", {}], queryFn: () => api("/admin/smartmatch/analytics") });
@@ -33,6 +158,7 @@ export function SmartMatchHome() {
   return (
     <>
       <PageHeader title="JobRadar SmartMatch" subtitle="Rule-based candidate–job matching with admin review. Scores are advisory — people make every decision." />
+      <ControlRoom />
       <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
         {tiles.map(([Icon, t, d, to]) => (
           <button key={t} onClick={() => navigate(to)} className="flex items-start gap-4 rounded-2xl border border-gray-200 bg-white p-5 text-left transition-transform hover:-translate-y-0.5 hover:border-brand" data-testid={`sm-tile-${t}`}>

@@ -216,6 +216,10 @@ export function MatchTable({ filters, mode = "job", title, defaultChannels, read
                         {!m.job_eligible ? <p className="mt-1 text-[11px] text-red-600">Job no longer eligible</p> : null}
                         {m.rejection_reason ? <p className="mt-1 text-[11px] text-gray-500">Reason: {m.rejection_reason}</p> : null}
                         {m.admin_comment ? <p className="mt-1 text-[11px] text-gray-500">Note: {m.admin_comment}</p> : null}
+                        <div className="mt-1 flex flex-wrap gap-1">
+                          {m.contacted_at ? <Badge label="Contacted" color="brand" data-testid={`contacted-${m.match_id}`} /> : null}
+                          {m.shortlisted_at ? <Badge label="Shortlisted" color="success" data-testid={`shortlisted-${m.match_id}`} /> : null}
+                        </div>
                       </td>
                       <td className="px-3 py-3">
                         <div className="flex flex-wrap gap-1">
@@ -226,6 +230,8 @@ export function MatchTable({ filters, mode = "job", title, defaultChannels, read
                           {!readOnly && m.status === "suggested" ? <Button size="sm" variant="ghost" title="Mark pending review" onClick={() => review([m.match_id], "pending_review")} data-testid={`pending-${m.match_id}`} /> : null}
                           {!readOnly && ["approved", "shared"].includes(m.status) ? <Button size="sm" variant="outline" title="Send alert" onClick={() => setDialog({ type: "share", ids: [m.match_id] })} data-testid={`share-${m.match_id}`} /> : null}
                           {readOnly ? null : <Button size="sm" variant="ghost" title="Comment" onClick={() => setDialog({ type: "comment", ids: [m.match_id] })} data-testid={`comment-${m.match_id}`} />}
+                          {readOnly ? null : <Button size="sm" variant="ghost" title={m.contacted_at ? "Unmark contacted" : "Mark contacted"} onClick={() => review([m.match_id], m.contacted_at ? "unmark_contacted" : "mark_contacted")} data-testid={`mark-contacted-${m.match_id}`} />}
+                          {readOnly ? null : <Button size="sm" variant="ghost" title={m.shortlisted_at ? "Unshortlist" : "Shortlist"} onClick={() => review([m.match_id], m.shortlisted_at ? "unmark_shortlisted" : "mark_shortlisted")} data-testid={`mark-shortlisted-${m.match_id}`} />}
                           <Button size="sm" variant="ghost" title="" icon={<History className="h-3.5 w-3.5" />} onClick={() => setDialog({ type: "history", m })} data-testid={`history-${m.match_id}`} />
                         </div>
                       </td>

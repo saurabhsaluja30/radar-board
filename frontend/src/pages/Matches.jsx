@@ -43,6 +43,7 @@ function MatchCard({ j, refresh }) {
             <span className="flex items-center gap-1"><Building2 className="h-3.5 w-3.5" />{j.company}</span>
             <span className="flex items-center gap-1"><MapPin className="h-3.5 w-3.5" />{j.location || j.city || j.country}</span>
             <span>{j.work_mode}</span>
+            {j.industry_category ? <span>{j.industry_category}</span> : null}
           </p>
         </button>
         <div className="shrink-0 text-right">
@@ -57,6 +58,9 @@ function MatchCard({ j, refresh }) {
       </p>
       {m.explanation.length ? (
         <div className="text-sm text-gray-600"><b className="text-gray-800">Why this job matches your profile:</b> {m.explanation.slice(0, 4).join(" · ")}</div>
+      ) : null}
+      {m.matched_skills?.length ? (
+        <p className="text-xs text-emerald-700" data-testid={`match-skills-${j.job_id}`}><b>Your matching skills:</b> {m.matched_skills.join(", ")}</p>
       ) : null}
       {m.missing_mandatory_skills.length ? (
         <p className="flex items-start gap-1.5 rounded-lg bg-red-50 p-2 text-xs text-red-700" data-testid={`match-gaps-${j.job_id}`}><AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />Mandatory skill gaps: {m.missing_mandatory_skills.join(", ")}</p>
@@ -76,7 +80,7 @@ function MatchCard({ j, refresh }) {
   );
 }
 
-const TABS = [["shared", "Shared by JobRadar"], ["recommended", "Recommended Jobs"], ["strong", "Strong Matches"], ["recent", "Recently Added"],
+const TABS = [["shared", "Job Alerts"], ["recommended", "Recommended Jobs"], ["strong", "Strong Matches"], ["recent", "Recently Added"],
   ["saved", "Saved Jobs"], ["viewed", "Previously Viewed"]];
 
 export default function Matches() {
@@ -106,13 +110,13 @@ export default function Matches() {
             <ProfileCompletion compact />
           </div>
           {list.length === 0 ? (
-            <EmptyState title="Nothing here yet" subtitle={tab === "shared" ? "When JobRadar approves an opportunity for you, it will appear here." : "Complete your profile to improve your matches."} data-testid="matches-empty" />
+            <EmptyState title="Nothing here yet" subtitle={tab === "shared" ? "When a new job strongly matches your profile, JobRadar alerts you here." : "Complete your profile to improve your matches."} data-testid="matches-empty" />
           ) : (
             <div className="grid gap-4 lg:grid-cols-2" data-testid={`matches-list-${tab}`}>
               {list.map((j) => (
                 <div key={j.job_id} onMouseEnter={() => j.notification && markRead(j.notification)}>
                   {j.notification ? (
-                    <p className="mb-1.5 text-xs font-semibold text-brand">{j.notification.read_at ? "" : "New · "}Shared by JobRadar on {formatDate(j.notification.sent_at)}</p>
+                    <p className="mb-1.5 text-xs font-semibold text-brand">{j.notification.read_at ? "" : "New · "}Job alert from JobRadar on {formatDate(j.notification.sent_at)}</p>
                   ) : null}
                   <MatchCard j={j} refresh={refresh} />
                 </div>

@@ -70,6 +70,30 @@ _inflight: set = set()
 MAX_UPLOAD = 5 * 1024 * 1024
 
 
+def file_to_text(name: str, data: bytes) -> str:
+    """Plain text from a PDF (first 10 pages) or DOCX file. Raises HTTPException(400) if unreadable."""
+    n = (name or "").lower()
+    try:
+        if n.endswith(".pdf") or data[:4] == b"%PDF":
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(data))
+            return "\n".join((pg.extract_text() or "") for pg in reader.pages[:10])
+        if n.endswith(".docx") or data[:2] == b"PK":
+            from docx import Document
+            d = Document(io.BytesIO(data))
+            parts = [para.text for para in d.paragraphs]
+            for t in d.tables:
+                for row in t.rows:
+                    parts.append(" | ".join(c.text.strip() for c in row.cells if c.text.strip()))
+            return "\n".join(parts)
+    except Exception as e:
+        logger.warning(f"resume file parse failed: {e}")
+        raise HTTPException(400, "We couldn't open this file. Please upload a valid PDF or Word (.docx) file, "
+                                 "or copy and paste your resume text instead.")
+    raise HTTPException(400, "Unsupported file type. Please upload a PDF or Word (.docx) file. "
+                             "Older .doc files: save as .docx or paste the text.")
+
+
 # ---------------------------------------------------------------------------
 # Request models
 # ---------------------------------------------------------------------------
@@ -416,28 +440,6 @@ def build_router(db, get_current_user, require_admin, compute_membership, now_ut
                                     req.personal.dict(), data.get("sections"), "", "ai_builder")
             await record_usage(user, "resume_generation", doc["resume_id"])
         return {"resume": doc}
-
-    def file_to_text(name: str, data: bytes) -> str:
-        n = (name or "").lower()
-        try:
-            if n.endswith(".pdf") or data[:4] == b"%PDF":
-                from pypdf import PdfReader
-                reader = PdfReader(io.BytesIO(data))
-                return "\n".join((pg.extract_text() or "") for pg in reader.pages[:10])
-            if n.endswith(".docx") or data[:2] == b"PK":
-                from docx import Document
-                d = Document(io.BytesIO(data))
-                parts = [para.text for para in d.paragraphs]
-                for t in d.tables:
-                    for row in t.rows:
-                        parts.append(" | ".join(c.text.strip() for c in row.cells if c.text.strip()))
-                return "\n".join(parts)
-        except Exception as e:
-            logger.warning(f"resume file parse failed: {e}")
-            raise HTTPException(400, "We couldn't open this file. Please upload a valid PDF or Word (.docx) file, "
-                                     "or copy and paste your resume text instead.")
-        raise HTTPException(400, "Unsupported file type. Please upload a PDF or Word (.docx) file. "
-                                 "Older .doc files: save as .docx or paste the text.")
 
     @r.post("/career/resumes/extract-file")
     async def extract_resume_file(file: UploadFile = File(...), user=Depends(get_current_user)):

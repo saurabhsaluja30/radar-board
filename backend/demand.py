@@ -1,4 +1,3 @@
-import asyncio
 import csv
 import io
 import re
@@ -43,15 +42,16 @@ def norm(v) -> str:
     return v or NS
 
 
-def build_router(db, require_admin, compute_membership, now_utc):
+def build_router(db, require_admin, compute_memberships, now_utc):
     r = APIRouter()
 
     async def enriched():
         users = await db.users.find({"role": "candidate"}, {"_id": 0, "password": 0}).to_list(50000)
         paid_ids = set(await db.payments.distinct("candidate_id", {"status": "successful"}))
         out = []
-        memberships = await asyncio.gather(*(compute_membership(u["user_id"]) for u in users))
-        for u, m in zip(users, memberships):
+        ms = await compute_memberships([u["user_id"] for u in users])
+        for u in users:
+            m = ms[u["user_id"]]
             out.append({
                 **u, "industry": bucket(u.get("industry")), "industry_raw": norm(u.get("industry")),
                 "preferred_industries": sorted({bucket(i) for i in (u.get("preferred_industries") or []) if i}) or [NS],

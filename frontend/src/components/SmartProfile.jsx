@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
-import { ALERT_FREQUENCIES, CURRENCIES, EMPLOYMENT_TYPES, NOTICE_PERIODS } from "@/lib/constants";
+import { ALERT_FREQUENCIES, CURRENCIES, EMPLOYMENT_TYPES, INDUSTRIES_WITH_OTHER, INDUSTRY_SHORT, NOTICE_PERIODS } from "@/lib/constants";
 import { Button, Card, Chip, ChipRow, errMsg, Input, notify, Switch } from "@/components/kit";
 
 export const ALERT_NOTICE = "JobRadar uses your profile to recommend relevant opportunities. You can change your notification preferences at any time.";
@@ -40,17 +40,22 @@ export function SmartProfileForm() {
     preferred_locations: fromList(user.preferred_locations || user.preferred_location), preferred_country: user.preferred_country || "",
     notice_period: user.notice_period || "", willing_to_relocate: !!user.willing_to_relocate, employment_type_pref: user.employment_type_pref || "",
     profile_status: user.profile_status || "Active", job_alert_consent: user.job_alert_consent ?? null, job_alert_frequency: user.job_alert_frequency || "Instant",
+    current_location: user.current_location || "", relevant_experience: user.relevant_experience ?? "", tools: fromList(user.tools),
+    certifications: fromList(user.certifications), highest_qualification: user.highest_qualification || "", institution: user.institution || "",
+    alert_muted_industries: user.alert_muted_industries || [],
   }));
   const [busy, setBusy] = useState(false);
   const set = (k, v) => setF((x) => ({ ...x, [k]: v }));
   const bind = (k) => ({ value: f[k], onChange: (e) => set(k, e.target.value) });
   const save = async () => {
     const exp = f.total_experience === "" ? null : Number(f.total_experience);
+    const rel = f.relevant_experience === "" ? null : Number(f.relevant_experience);
     const ctc = f.expected_ctc === "" ? null : Number(String(f.expected_ctc).replace(/,/g, ""));
-    if (Number.isNaN(exp) || Number.isNaN(ctc)) return notify("Experience and expected CTC must be numbers", "error");
+    if (Number.isNaN(exp) || Number.isNaN(rel) || Number.isNaN(ctc)) return notify("Experience and expected CTC must be numbers", "error");
     setBusy(true);
     try {
-      const body = { ...f, total_experience: exp, expected_ctc: ctc, primary_skills: toList(f.primary_skills), secondary_skills: toList(f.secondary_skills),
+      const body = { ...f, total_experience: exp, relevant_experience: rel, expected_ctc: ctc, tools: toList(f.tools), certifications: toList(f.certifications),
+        primary_skills: toList(f.primary_skills), secondary_skills: toList(f.secondary_skills),
         preferred_titles: toList(f.preferred_titles), preferred_locations: toList(f.preferred_locations) };
       Object.keys(body).forEach((k) => (body[k] === "" || body[k] === null) && delete body[k]);
       if (f.job_alert_consent === (user.job_alert_consent ?? null)) delete body.job_alert_consent;
@@ -82,7 +87,9 @@ export function SmartProfileForm() {
       </div>
       <div className="grid gap-4 md:grid-cols-2">
         <Input label="Total work experience (years)" inputMode="decimal" {...bind("total_experience")} data-testid="sp-experience" />
+        <Input label="Relevant experience (years)" inputMode="decimal" {...bind("relevant_experience")} data-testid="sp-rel-experience" />
         <Input label="Current company" {...bind("current_company")} data-testid="sp-company" />
+        <Input label="Current location" {...bind("current_location")} data-testid="sp-current-location" />
         <div className="grid grid-cols-[1fr_110px] gap-2">
           <Input label="Expected CTC (annual, full amount)" placeholder="e.g. 1200000" inputMode="numeric" {...bind("expected_ctc")} data-testid="sp-expected-ctc" />
           <label className="block"><span className="label">Currency</span>
@@ -94,6 +101,10 @@ export function SmartProfileForm() {
         <Input label="Preferred country" {...bind("preferred_country")} data-testid="sp-country" />
         <Input label="Primary skills" placeholder="e.g. Recruiting, Excel, SAP" {...bind("primary_skills")} data-testid="sp-primary-skills" />
         <Input label="Secondary skills" {...bind("secondary_skills")} data-testid="sp-secondary-skills" />
+        <Input label="Software & tools" placeholder="e.g. Sabre, Amadeus, Tally" {...bind("tools")} data-testid="sp-tools" />
+        <Input label="Certifications" {...bind("certifications")} data-testid="sp-certifications" />
+        <Input label="Highest qualification" placeholder="e.g. Bachelor's, MBA" {...bind("highest_qualification")} data-testid="sp-qualification" />
+        <Input label="Institution" {...bind("institution")} data-testid="sp-institution" />
         <Input label="Preferred job titles" placeholder="e.g. HR Executive, Talent Acquisition" {...bind("preferred_titles")} data-testid="sp-titles" />
         <Input label="Preferred locations" placeholder="e.g. Mumbai, Pune, Dubai" {...bind("preferred_locations")} data-testid="sp-locations" />
       </div>
@@ -121,6 +132,17 @@ export function SmartProfileForm() {
           ))}
         </div>
         {f.job_alert_consent === null ? <p className="text-xs text-brand" data-testid="sp-alert-none">Not selected yet — you'll still see relevant opportunities in-app.</p> : null}
+        {f.job_alert_consent !== false ? (
+          <div data-testid="sp-muted">
+            <ChipRow label="Don't alert me about jobs in">
+              {INDUSTRIES_WITH_OTHER.map((n) => (
+                <Chip key={n} label={INDUSTRY_SHORT[n] || n} selected={f.alert_muted_industries.includes(n)} data-testid={`sp-mute-${n}`}
+                  onClick={() => set("alert_muted_industries", f.alert_muted_industries.includes(n) ? f.alert_muted_industries.filter((x) => x !== n) : [...f.alert_muted_industries, n])} />
+              ))}
+            </ChipRow>
+            <p className="mt-1 text-xs text-gray-500">Muted categories still appear in your matches; you just won't get alerts for them.</p>
+          </div>
+        ) : null}
         {f.job_alert_consent === true ? (
           <ChipRow label="Email alert frequency">
             {ALERT_FREQUENCIES.map((n) => <Chip key={n} label={n} selected={f.job_alert_frequency === n} onClick={() => set("job_alert_frequency", n)} data-testid={`sp-freq-${n}`} />)}

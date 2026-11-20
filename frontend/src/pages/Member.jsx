@@ -11,6 +11,7 @@ import { JobCard } from "@/components/JobCard";
 import { CareerToolsCards } from "@/components/career";
 import { Page } from "@/components/Layout";
 import { ALERT_NOTICE, ProfileCompletion, SmartProfileForm } from "@/components/SmartProfile";
+import { ResumeCard } from "@/components/ResumeCard";
 import { GoogleButton, OrLine } from "@/pages/Auth";
 
 function LoginPrompt({ title, text }) {
@@ -458,7 +459,7 @@ export function Profile() {
           </ChipRow>
           <Button title="Save Changes" loading={busy === "save"} onClick={save} data-testid="profile-save" />
         </Card>
-        {user.role === "candidate" ? <div className="space-y-6 lg:col-span-2"><ProfileCompletion /><SmartProfileForm /></div> : null}
+        {user.role === "candidate" ? <div className="space-y-6 lg:col-span-2"><ProfileCompletion /><ResumeCard /><SmartProfileForm key={user.updated_at} /></div> : null}
         {user.auth_provider === "password" ? (
           <Card className="h-fit space-y-4">
             <h3 className="h-sec">Change Password</h3>
