@@ -1,7 +1,7 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Trash2 } from "lucide-react";
+import { Mic, Square, Trash2 } from "lucide-react";
 import { api } from "@/lib/api";
 import { formatDate } from "@/lib/constants";
 import { Badge, Button, Card, Chip, ChipRow, EmptyState, errMsg, Input, notify, PageHeader, Spinner } from "@/components/kit";
@@ -158,6 +158,89 @@ function Report({ session }) {
   );
 }
 
+const Recognition = typeof window !== "undefined" ? window.SpeechRecognition || window.webkitSpeechRecognition : null;
+
+// Speak an answer: the browser turns speech into text in the answer box (Chrome and Edge). No audio is sent to JobRadar.
+function VoiceButton({ onText, disabled }) {
+  const rec = useRef(null);
+  const [on, setOn] = useState(false);
+  useEffect(() => () => rec.current?.abort(), []);
+  if (!Recognition) return <p className="text-xs text-gray-400" data-testid="iv-voice-unsupported">Voice answers work in Chrome and Edge.</p>;
+  const start = () => {
+    const r = new Recognition();
+    r.lang = "en-IN";
+    r.continuous = true;
+    r.interimResults = false;
+    r.onresult = (e) => {
+      const text = Array.from(e.results).slice(e.resultIndex).filter((x) => x.isFinal).map((x) => x[0].transcript).join(" ");
+      if (text.trim()) onText(text.trim());
+    };
+    r.onerror = (e) => {
+      if (e.error === "not-allowed") notify("Allow microphone access in your browser to answer by voice.", "error");
+      else if (e.error !== "no-speech" && e.error !== "aborted") notify("Voice input stopped. You can type instead.", "error");
+    };
+    r.onend = () => setOn(false);
+    rec.current = r;
+    r.start();
+    setOn(true);
+  };
+  const stop = () => rec.current?.stop();
+  return (
+    <Button variant={on ? "danger" : "outline"} size="sm" disabled={disabled && !on} icon={on ? <Square className="h-3.5 w-3.5" /> : <Mic className="h-3.5 w-3.5" />}
+      title={on ? "Stop speaking" : "Answer by voice"} onClick={on ? stop : start} data-testid="iv-voice" />
+  );
+}
+
+const READY_COLOR = { "Interview ready": "success", "Nearly ready": "warning", "Keep practising": "error" };
+
+export function ReadinessReport() {
+  const navigate = useNavigate();
+  const { data } = useQuery({ queryKey: ["readiness"], queryFn: () => api("/career/readiness") });
+  if (!data) return <Spinner />;
+  if (!data.sessions) {
+    return <Card data-testid="readiness-empty"><p className="h-sec">Interview readiness</p><p className="muted mt-1">Complete a mock interview to see your readiness report.</p>
+      <Button className="mt-3" size="sm" title="Start Practising" onClick={() => navigate("/career/interview")} /></Card>;
+  }
+  const Bar = ({ label, score, sub }) => (
+    <div>
+      <div className="flex justify-between text-sm"><span className="font-semibold">{label}</span><b className="text-brand">{score}</b></div>
+      <div className="mt-1 h-2 overflow-hidden rounded-full bg-brand-soft"><div className="h-full bg-brand" style={{ width: `${score}%` }} /></div>
+      {sub ? <p className="mt-0.5 text-[11px] text-gray-400">{sub}</p> : null}
+    </div>
+  );
+  return (
+    <Card className="space-y-5" data-testid="readiness-report">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="h-sec">Interview readiness</p>
+          <p className="muted text-sm">From your last {Math.min(data.sessions, 5)} completed practice session{data.sessions === 1 ? "" : "s"}, with recent ones counting more.</p>
+        </div>
+        <div className="text-right">
+          <p className="text-3xl font-extrabold text-brand" data-testid="readiness-score">{data.score}<span className="text-base text-gray-400">/100</span></p>
+          <Badge label={data.level} color={READY_COLOR[data.level] || "info"} />
+        </div>
+      </div>
+      {data.trend.length > 1 ? (
+        <div className="flex h-24 items-end gap-3" data-testid="readiness-trend">
+          {data.trend.map((t) => (
+            <div key={t.session_id} className="flex h-full flex-1 flex-col items-center justify-end gap-1" title={`${t.job_title} · ${t.interview_type} · ${formatDate(t.at)}`}>
+              <span className="text-[11px] font-bold">{t.score}</span>
+              <div className="w-full rounded-t-md bg-brand" style={{ height: `${Math.max(4, t.score) * 0.8}%` }} />
+            </div>
+          ))}
+        </div>
+      ) : null}
+      <div className="grid gap-6 md:grid-cols-2">
+        {data.dimensions.length ? <div className="space-y-3"><p className="text-xs font-bold uppercase text-gray-400">By skill</p>{data.dimensions.map((d) => <Bar key={d.key} label={d.label} score={d.score} />)}</div> : null}
+        {data.by_category.length ? <div className="space-y-3"><p className="text-xs font-bold uppercase text-gray-400">By question type</p>{data.by_category.map((c) => <Bar key={c.category} label={c.category} score={c.score} sub={`${c.answers} answer${c.answers === 1 ? "" : "s"}`} />)}</div> : null}
+      </div>
+      {data.focus.length ? <div><p className="font-bold">What to improve next</p><BulletList items={data.focus} /></div> : null}
+      {data.strengths.length ? <div><p className="font-bold">Your strengths</p><BulletList items={data.strengths} /></div> : null}
+      <p className="text-[11px] text-gray-400">{data.confidence_note} {data.disclaimer}</p>
+    </Card>
+  );
+}
+
 export function InterviewSession() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -168,6 +251,7 @@ export function InterviewSession() {
   const [hint, setHint] = useState(null);
   const [busy, setBusy] = useState(null);
   const [fbFor, setFbFor] = useState(null);
+  const [spoken, setSpoken] = useState(false);
 
   useEffect(() => {
     if (data?.session) {
@@ -194,12 +278,13 @@ export function InterviewSession() {
   const goNext = (s) => {
     setSession(s);
     setAnswer("");
+    setSpoken(false);
     setHint(null);
     const next = s.questions.findIndex((q) => q.status === "pending");
     setFbFor(s.feedback_mode === "each" && s.questions[idx]?.feedback && s.questions[idx].status === "answered" ? idx : null);
     setIdx(next === -1 ? total : next);
   };
-  const submit = () => call("submit", async () => goNext((await api(`/career/interviews/${id}/answer`, { method: "POST", body: { index: idx, answer } })).session));
+  const submit = () => call("submit", async () => goNext((await api(`/career/interviews/${id}/answer`, { method: "POST", body: { index: idx, answer, mode: spoken ? "voice" : "typed" } })).session));
   const skip = () => call("skip", async () => goNext((await api(`/career/interviews/${id}/skip`, { method: "POST", body: { index: idx } })).session));
   const getHint = () => call("hint", async () => setHint((await api(`/career/interviews/${id}/hint`, { method: "POST", body: { index: idx } })).hint));
   const endNow = () => call("end", async () => {
@@ -228,7 +313,11 @@ export function InterviewSession() {
             <p className="text-xl font-bold leading-snug text-gray-900" data-testid="iv-question-text">{q.question}</p>
             {hint ? <p className="rounded-xl bg-amber-50 p-3 text-sm text-amber-800" data-testid="iv-hint">💡 {hint}</p> : null}
             <textarea value={answer} onChange={(e) => setAnswer(e.target.value)} maxLength={5000} className={areaCls}
-              placeholder="Type your answer here. Use real examples from your own experience." data-testid="iv-answer" />
+              placeholder="Type or speak your answer. Use real examples from your own experience." data-testid="iv-answer" />
+            <div className="flex flex-wrap items-center gap-2">
+              <VoiceButton disabled={!!busy} onText={(t) => { setSpoken(true); setAnswer((a) => (a.trim() ? `${a.trimEnd()} ${t}` : t)); }} />
+              <span className="text-xs text-gray-400">Check the text before submitting: speech recognition can mishear words.</span>
+            </div>
             <div className="flex flex-wrap items-center gap-2">
               <Button title="Submit Answer" loading={busy === "submit"} disabled={!!busy || answer.trim().length < 5} onClick={submit} data-testid="iv-submit" />
               <Button variant="outline" size="sm" title="Get Hint" loading={busy === "hint"} disabled={!!busy} onClick={getHint} data-testid="iv-hint-btn" />
@@ -322,19 +411,7 @@ export function CareerHistory() {
         {tab === "interviews" ? (
           <>
             <Button size="sm" title="New Practice Session" onClick={() => navigate("/career/interview")} data-testid="hist-new-interview" />
-            {scored.length > 1 ? (
-              <Card data-testid="hist-progress">
-                <p className="h-sec mb-4">Your progress</p>
-                <div className="flex h-32 items-end gap-4">
-                  {scored.map((s) => (
-                    <div key={s.session_id} className="flex flex-1 flex-col items-center gap-1">
-                      <span className="text-xs font-bold">{s.overall_score}</span>
-                      <div className="w-full rounded-t-md bg-brand" style={{ height: `${Math.max(4, s.overall_score)}%` }} />
-                    </div>
-                  ))}
-                </div>
-              </Card>
-            ) : null}
+            {scored.length ? <ReadinessReport /> : null}
             {ss.length === 0 ? <EmptyState title="No interview sessions yet" data-testid="hist-interviews-empty" /> : null}
             {ss.map((s) => (
               <Row key={s.session_id} testId={`hist-interview-${s.session_id}`} title={s.job_title} sub={`${s.interview_type} · ${formatDate(s.created_at)}`}

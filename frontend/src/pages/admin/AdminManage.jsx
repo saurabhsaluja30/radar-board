@@ -303,28 +303,56 @@ export function AdminSubscriptions() {
 
 export function AdminPayments() {
   const [demo, setDemo] = useState("all");
+  const qc = useQueryClient();
   const { data } = useQuery({ queryKey: ["admin-payments", demo], queryFn: () => api("/admin/payments", { query: { demo } }) });
+  const { data: summary } = useQuery({ queryKey: ["admin-payments-summary"], queryFn: () => api("/admin/payments/summary") });
+  const [busy, setBusy] = useState(null);
   const payments = data?.payments || [];
-  const sum = (isDemo) => payments.filter((p) => !!p.is_demo === isDemo && p.status === "successful").reduce((s, p) => s + p.amount, 0);
+  const paid = ["successful", "refunded", "partially_refunded"];
+  const sum = (isDemo) => payments.filter((p) => !!p.is_demo === isDemo && paid.includes(p.status)).reduce((s, p) => s + p.amount - (p.refunded_amount || 0), 0);
+  const reconcile = async (p) => {
+    setBusy(p.payment_id);
+    try {
+      const r = await api(`/admin/payments/${p.payment_id}/reconcile`, { method: "POST" });
+      notify(`Checked with Razorpay: ${r.outcome}`, "success");
+      qc.invalidateQueries({ queryKey: ["admin-payments"] });
+      qc.invalidateQueries({ queryKey: ["admin-payments-summary"] });
+    } catch (e) {
+      notify(e.message || "Could not reach Razorpay", "error");
+    } finally {
+      setBusy(null);
+    }
+  };
+  const mode = summary?.mode;
   const color = (s) => (s === "successful" ? "success" : s === "failed" ? "error" : "info");
   return (
     <>
       <PageHeader title="Payments" />
+      <Card className="mb-6 text-sm" data-testid="pay-gateway-status">
+        <p className="font-bold">Payment gateway: {mode?.gateway === "razorpay" ? `Razorpay${mode.test_mode ? " (test mode)" : " (live)"}` : "Not configured — demo checkout only"}</p>
+        <p className="mt-1 text-gray-600">
+          {mode?.gateway === "razorpay"
+            ? summary?.webhook_configured ? "Webhook secret is set. Payments are confirmed even if the candidate closes the page." : "Webhook secret is missing. Add RAZORPAY_WEBHOOK_SECRET so payments are confirmed if the candidate closes the page."
+            : "Add RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET and RAZORPAY_WEBHOOK_SECRET in Emergent Secrets to take real payments."}
+          {summary?.needs_attention ? <span className="ml-1 font-semibold text-red-600">{summary.needs_attention} paid order(s) are not activated yet. Use Check with Razorpay.</span> : null}
+        </p>
+      </Card>
       <div className="mb-6 grid gap-4 md:grid-cols-2">
-        <Card><p className="text-sm font-semibold text-gray-500">Real Revenue</p><p className="text-3xl font-extrabold text-emerald-600" data-testid="pay-real-revenue">{money(sum(false))}</p></Card>
+        <Card><p className="text-sm font-semibold text-gray-500">Real Revenue (after refunds)</p><p className="text-3xl font-extrabold text-emerald-600" data-testid="pay-real-revenue">{money(sum(false))}</p></Card>
         <Card><p className="text-sm font-semibold text-gray-500">Demo Revenue</p><p className="text-3xl font-extrabold text-amber-600" data-testid="pay-demo-revenue">{money(sum(true))}</p></Card>
       </div>
       <div className="mb-6 flex gap-2">
         {[["all", "All"], ["real", "Real"], ["demo", "Demo"]].map(([v, l]) => <Chip key={v} label={l} selected={demo === v} onClick={() => setDemo(v)} data-testid={`pay-filter-${v}`} />)}
       </div>
-      <Table head={["Plan", "Candidate", "Date / Txn", "Amount", "Status"]}>
+      <Table head={["Plan", "Candidate", "Date / Txn", "Amount", "Status", ""]}>
         {payments.map((p) => (
           <tr key={p.payment_id} data-testid={`admin-pay-${p.payment_id}`}>
             <Td className="font-bold">{p.plan_name} {p.is_demo ? <Badge label="DEMO" color="warning" /> : null}</Td>
             <Td>{p.candidate_email}</Td>
             <Td className="text-gray-500">{formatDate(p.payment_date)}<br /><span className="text-xs">{p.transaction_id}</span></Td>
-            <Td className="font-extrabold">{money(p.amount, p.currency)}</Td>
-            <Td><Badge label={p.status} color={color(p.status)} /></Td>
+            <Td className="font-extrabold">{money(p.amount, p.currency)}{p.refunded_amount ? <><br /><span className="text-xs font-semibold text-red-600">−{money(p.refunded_amount, p.currency)} refunded</span></> : null}</Td>
+            <Td><Badge label={p.status === "created" ? "not completed" : p.status} color={color(p.status)} />{p.receipt_no ? <><br /><span className="text-xs text-gray-500">{p.receipt_no}</span></> : null}</Td>
+            <Td>{p.gateway === "razorpay" && !p.subscription_id ? <Button size="sm" variant="outline" title="Check with Razorpay" loading={busy === p.payment_id} onClick={() => reconcile(p)} data-testid={`pay-reconcile-${p.payment_id}`} /> : null}</Td>
           </tr>
         ))}
       </Table>

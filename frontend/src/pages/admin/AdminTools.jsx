@@ -214,7 +214,7 @@ export function AdminLaunch() {
 
 const TOOLS = [["resume_builder", "ATS Resume Builder"], ["resume_analyser", "Resume Analyser"], ["interview_coach", "AI Interview Coach"]];
 const KINDS = [["resume_generation", "Resume generations"], ["resume_analysis", "Resume analyses"], ["interview_sessions", "Interview sessions"]];
-const TIERS = [["free", "Free users"], ["quarterly", "Quarterly"], ["half_yearly", "Half-Yearly"], ["annual", "Annual"]];
+const TIERS = [["free", "Free users"], ["monthly", "Monthly"], ["quarterly", "Quarterly"], ["half_yearly", "Half-Yearly"], ["annual", "Annual"]];
 const numCls = "field w-24 py-2 text-center";
 
 export function AdminCareer() {

@@ -169,8 +169,8 @@ export function ResumeBuilder() {
           <div className="grid gap-6 lg:grid-cols-[360px_1fr]">
             <Card className="h-fit space-y-3" data-testid="rb-upload-card">
               <p className="font-extrabold">Upload Your Resume</p>
-              <p className="text-sm text-gray-500">PDF or Word (.docx), up to 5 MB. Scanned images can't be read — paste the text instead.</p>
-              <input ref={fileRef} type="file" accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+              <p className="text-sm text-gray-500">PDF or Word (.doc or .docx), up to 5 MB. Scanned images can't be read — paste the text instead.</p>
+              <input ref={fileRef} type="file" accept=".pdf,.doc,.docx,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 className="hidden" onChange={onFile} data-testid="rb-upload-input" />
               <Button full title="Upload PDF or Word File" icon={<Upload className="h-4 w-4" />} loading={busy === "upload"}
                 disabled={!!busy && busy !== "upload"} onClick={() => fileRef.current?.click()} data-testid="rb-upload" />

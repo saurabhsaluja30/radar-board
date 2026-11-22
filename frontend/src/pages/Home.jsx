@@ -94,11 +94,11 @@ function Plans({ plans }) {
   return (
     <section className="container-x py-12">
       <h2 className="text-2xl font-extrabold text-gray-900">Membership Plans</h2>
-      <div className="mt-8 grid gap-5 md:grid-cols-3">
+      <div className="mt-8 grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
         {plans.map((p) => (
           <button key={p.plan_id} onClick={() => navigate("/plans")} data-testid={`home-plan-${p.plan_id}`}
             className={`rounded-2xl border p-6 text-left transition-transform hover:-translate-y-1 ${p.featured ? "border-brand bg-brand text-white" : "border-gray-200 bg-white"}`}>
-            {p.featured ? <span className="rounded-full bg-white/20 px-3 py-1 text-[11px] font-bold uppercase">Recommended</span> : null}
+            {p.featured ? <span className="rounded-full bg-white/20 px-3 py-1 text-[11px] font-bold uppercase">{p.best_value ? "Best Value" : "Recommended"}</span> : null}
             <p className="mt-3 font-bold">{p.name}</p>
             <p className="mt-2 text-3xl font-extrabold">{money(p.price, p.currency)}</p>
             <p className={`mt-1 text-sm ${p.featured ? "text-violet-100" : "text-gray-500"}`}>{p.duration_days} days access</p>

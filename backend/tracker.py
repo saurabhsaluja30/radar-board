@@ -13,16 +13,23 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Header, HTT
 from fastapi.responses import Response
 from pydantic import BaseModel
 
+# The ten application stages, in order. Existing keys are kept so old records need no migration:
+# "not_selected" is shown as Rejected and "hired" as Joined.
 STATUSES = {
-    "interested": "Interested", "contacted": "Contacted Recruiter", "applied": "Applied",
-    "responded": "Recruiter Responded", "interview_scheduled": "Interview Scheduled",
-    "interview_completed": "Interview Completed", "offer_received": "Offer Received", "hired": "Hired",
-    "not_selected": "Not Selected", "no_response": "No Response",
+    "interested": "Interested", "applied": "Applied", "resume_viewed": "Resume Viewed", "shortlisted": "Shortlisted",
+    "interview_scheduled": "Interview Scheduled", "interview_completed": "Interview Completed", "selected": "Selected",
+    "not_selected": "Rejected", "offer_received": "Offer Received", "hired": "Joined",
+    # Earlier updates, still valid for existing records and recruiter follow-ups.
+    "contacted": "Contacted Recruiter", "responded": "Recruiter Responded", "no_response": "No Response",
 }
+STAGES = list(STATUSES)[:10]
+# Set only after JobRadar's team verifies proof, never by the candidate alone.
+VERIFIED_ONLY = {"resume_viewed"}
+EARLY = {"interested", "applied", "contacted", "responded", "no_response"}
 TERMINAL = {"hired", "not_selected"}
 REMINDERS = [(30, "Any update on this opportunity?"), (14, "Have you received an interview call?"),
              (7, "Did you submit your application?"), (3, "Have you contacted the recruiter?")]
-EVIDENCE_KINDS = {"interview_invite": "Interview invitation", "interview_confirmation": "Interview confirmation",
+EVIDENCE_KINDS = {"resume_viewed": "Proof the employer viewed my resume", "interview_invite": "Interview invitation", "interview_confirmation": "Interview confirmation",
                   "offer_letter": "Offer letter", "joining_confirmation": "Joining confirmation"}
 EVIDENCE_TYPES = {"application/pdf": "pdf", "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}
 CONVERSIONS = [
@@ -32,7 +39,8 @@ CONVERSIONS = [
     ("interview_scheduled", "offer_received", "Interview Scheduled → Offer Received", "Of tracked jobs that reached 'Interview Scheduled', the share that also reached 'Offer Received'."),
     ("applied", "hired", "Applied → Hired", "Of tracked jobs that reached 'Applied', the share that also reached 'Hired'."),
 ]
-FUNNEL = ["contacted", "applied", "responded", "interview_scheduled", "interview_completed", "offer_received", "hired"]
+FUNNEL = ["contacted", "applied", "resume_viewed", "responded", "shortlisted", "interview_scheduled", "interview_completed",
+          "selected", "offer_received", "hired"]
 
 from storage import APP_NAME, _get_object, _put_object, warm_storage  # noqa: F401 - warm_storage is re-exported for server.py
 
@@ -51,6 +59,59 @@ class StatusReq(BaseModel):
     hire_designation: Optional[str] = None
     joining_date: Optional[str] = None
     hire_feedback: Optional[str] = None
+
+
+class ExternalReq(BaseModel):
+    company: str
+    designation: str
+    location: Optional[str] = ""
+    application_link: Optional[str] = ""
+    applied_date: Optional[str] = None
+    status: str = "applied"
+    recruiter_name: Optional[str] = ""
+    recruiter_email: Optional[str] = ""
+    recruiter_phone: Optional[str] = ""
+    notes: Optional[str] = ""
+    follow_up_date: Optional[str] = None
+    follow_up_note: Optional[str] = ""
+
+
+class DetailsReq(BaseModel):
+    notes: Optional[str] = None
+    recruiter_name: Optional[str] = None
+    recruiter_email: Optional[str] = None
+    recruiter_phone: Optional[str] = None
+    applied_date: Optional[str] = None
+    follow_up_date: Optional[str] = None
+    follow_up_note: Optional[str] = None
+    # Only for applications added by hand:
+    company: Optional[str] = None
+    designation: Optional[str] = None
+    location: Optional[str] = None
+    application_link: Optional[str] = None
+
+
+def _day(v: Optional[str], label: str) -> Optional[str]:
+    if not v:
+        return None
+    try:
+        return date.fromisoformat(v[:10]).isoformat()
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"{label} must be a date (YYYY-MM-DD)")
+
+
+def _link(v: Optional[str]) -> str:
+    v = (v or "").strip()[:500]
+    if v and not re.match(r"^https?://", v, re.I):
+        raise HTTPException(status_code=400, detail="The application link must start with http:// or https://")
+    return v
+
+
+def _email(v: Optional[str]) -> str:
+    v = (v or "").strip()[:200]
+    if v and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", v):
+        raise HTTPException(status_code=400, detail="Please enter a valid recruiter email")
+    return v
 
 
 class SettingsReq(BaseModel):
@@ -84,6 +145,14 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
     def reminder_for(t: dict) -> Optional[dict]:
         if t.get("status") in TERMINAL:
             return None
+        # A follow-up date the candidate set comes first, from that day on, until dismissed or changed.
+        fu = t.get("follow_up_date")
+        if fu and fu <= now_utc().date().isoformat():
+            key = f"fu:{fu}"
+            if key not in (t.get("reminders_dismissed") or []):
+                note = (t.get("follow_up_note") or "").strip()
+                return {"key": key, "days": 0, "follow_up": True,
+                        "text": f"Follow-up due{': ' + note if note else ''}"}
         last = parse_dt(t.get("updated_at")) or now_utc()
         age = (now_utc() - last).days
         for days, text in REMINDERS:
@@ -96,7 +165,9 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
 
     async def public_item(t: dict, is_member: bool) -> dict:
         out = {k: v for k, v in t.items() if k not in ("reminders_dismissed", "reminders_emailed")}
-        if not is_member:
+        if not is_member and t.get("source") != "external":
+            # Recruiter details that came with a JobRadar job are a member feature; details the candidate typed
+            # in themselves (my_recruiter, or anything on an application they added) are always theirs to see.
             out["recruiter_name"] = out["recruiter_email"] = None
         out["status_label"] = STATUSES.get(t["status"], t["status"])
         out["reminder"] = reminder_for(t)
@@ -143,11 +214,101 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
         m = await compute_membership(user["user_id"])
         return {"item": await public_item(t, m["is_active"])}
 
+    @r.post("/tracker/external")
+    async def track_external(req: ExternalReq, user=Depends(get_current_user)):
+        """An application the candidate made outside JobRadar. Kept out of JobRadar's success analytics."""
+        if user.get("role") != "candidate":
+            raise HTTPException(status_code=403, detail="Only candidates can track applications")
+        company, designation = req.company.strip()[:200], req.designation.strip()[:200]
+        if not company or not designation:
+            raise HTTPException(status_code=400, detail="Company and job title are required")
+        if req.status not in STATUSES or req.status in VERIFIED_ONLY or req.status in ("interview_scheduled", "hired"):
+            raise HTTPException(status_code=400, detail="Choose Interested, Applied or another simple stage to start with")
+        now = now_iso()
+        applied = _day(req.applied_date, "Application date")
+        doc = {
+            "tracker_id": f"trk_{uuid.uuid4().hex[:12]}", "candidate_id": user["user_id"],
+            "job_id": f"ext_{uuid.uuid4().hex[:12]}", "source": "external",
+            "company": company, "designation": designation, "location": (req.location or "").strip()[:200],
+            "industry": "Not Specified", "application_link": _link(req.application_link),
+            "recruiter_name": (req.recruiter_name or "").strip()[:120], "recruiter_email": _email(req.recruiter_email),
+            "recruiter_phone": (req.recruiter_phone or "").strip()[:40], "notes": (req.notes or "").strip()[:2000],
+            "applied_date": applied, "follow_up_date": _day(req.follow_up_date, "Follow-up date"),
+            "follow_up_note": (req.follow_up_note or "").strip()[:200],
+            "status": req.status, "status_history": [{"status": req.status, "at": now}],
+            "reached": {"saved": now, req.status: now} if req.status != "interested" else {"saved": now},
+            "interview": None, "hire": None, "interview_verification": None, "hire_verification": None,
+            "reminders_dismissed": [], "reminders_emailed": [], "archived": False, "created_at": now, "updated_at": now,
+        }
+        await db.job_tracker.insert_one(dict(doc))
+        m = await compute_membership(user["user_id"])
+        return {"item": await public_item(doc, m["is_active"])}
+
+    @r.put("/tracker/{tracker_id}/details")
+    async def update_details(tracker_id: str, req: DetailsReq, user=Depends(get_current_user)):
+        t = await own(tracker_id, user)
+        external = t.get("source") == "external"
+        upd: dict = {}
+        if req.notes is not None:
+            upd["notes"] = req.notes.strip()[:2000]
+        if req.applied_date is not None:
+            upd["applied_date"] = _day(req.applied_date, "Application date")
+        if req.follow_up_date is not None:
+            upd["follow_up_date"] = _day(req.follow_up_date, "Follow-up date")
+        if req.follow_up_note is not None:
+            upd["follow_up_note"] = req.follow_up_note.strip()[:200]
+        rec = {"name": req.recruiter_name, "email": req.recruiter_email, "phone": req.recruiter_phone}
+        for k, v in rec.items():
+            if v is None:
+                continue
+            v = _email(v) if k == "email" else v.strip()[:120 if k == "name" else 40]
+            # On JobRadar jobs the job's own recruiter fields stay as published; the candidate's notes go alongside.
+            upd[f"recruiter_{k}" if external else f"my_recruiter.{k}"] = v
+        if external:
+            for k in ("company", "designation", "location"):
+                v = getattr(req, k)
+                if v is not None:
+                    if k != "location" and not v.strip():
+                        raise HTTPException(status_code=400, detail="Company and job title can't be empty")
+                    upd[k] = v.strip()[:200]
+            if req.application_link is not None:
+                upd["application_link"] = _link(req.application_link)
+        if not upd:
+            raise HTTPException(status_code=400, detail="Nothing to update")
+        upd["details_updated_at"] = now_iso()
+        await db.job_tracker.update_one({"tracker_id": tracker_id}, {"$set": upd})
+        t = await db.job_tracker.find_one({"tracker_id": tracker_id}, {"_id": 0})
+        m = await compute_membership(user["user_id"])
+        return {"item": await public_item(t, m["is_active"])}
+
+    @r.get("/tracker/summary")
+    async def tracker_summary(user=Depends(get_current_user)):
+        """Career Success Dashboard counts. Conversion uses verified interviews only; reported ones are shown apart."""
+        items = await db.job_tracker.find({"candidate_id": user["user_id"], "archived": {"$ne": True}},
+                                          {"_id": 0, "reached": 1, "status": 1, "source": 1, "interview_verification": 1,
+                                           "hire_verification": 1}).to_list(2000)
+        reached = lambda s: sum(1 for t in items if s in (t.get("reached") or {}))  # noqa: E731
+        applied = [t for t in items if "applied" in (t.get("reached") or {}) or
+                   any(s in (t.get("reached") or {}) for s in STAGES[2:])]
+        verified_iv = sum(1 for t in applied if t.get("interview_verification") == "verified")
+        return {
+            "tracked": len(items), "external": sum(1 for t in items if t.get("source") == "external"),
+            "applications": len(applied), "interviews_scheduled": reached("interview_scheduled"),
+            "interviews_completed": reached("interview_completed"), "offers": reached("offer_received"),
+            "joined": reached("hired"), "rejected": reached("not_selected"),
+            "interviews_verified": verified_iv,
+            "joined_verified": sum(1 for t in items if t.get("hire_verification") == "verified"),
+            "application_to_interview_verified": round(verified_iv * 100 / len(applied)) if applied else None,
+            "saved_jobs": await db.saved_jobs.count_documents({"candidate_id": user["user_id"]}),
+            "by_status": {s: sum(1 for t in items if t["status"] == s) for s in STATUSES},
+        }
+
     @r.get("/tracker")
     async def my_tracker(user=Depends(get_current_user)):
         items = await db.job_tracker.find({"candidate_id": user["user_id"], "archived": {"$ne": True}}, {"_id": 0}).sort("updated_at", -1).to_list(500)
         m = await compute_membership(user["user_id"])
-        return {"items": [await public_item(t, m["is_active"]) for t in items], "statuses": STATUSES,
+        return {"items": [await public_item(t, m["is_active"]) for t in items], "statuses": STATUSES, "stages": STAGES,
+                "verified_only": sorted(VERIFIED_ONLY),
                 "email_reminders": user.get("tracker_email_reminders", True)}
 
     @r.get("/tracker/job/{job_id}")
@@ -160,6 +321,10 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
         t = await own(tracker_id, user)
         if req.status not in STATUSES:
             raise HTTPException(status_code=400, detail="Unknown status")
+        if req.status in VERIFIED_ONLY and t["status"] != req.status:
+            raise HTTPException(status_code=400, detail=(
+                "Resume Viewed is shown only once it's verified. Share proof, such as the employer's message, "
+                "and JobRadar's team will confirm it."))
         now = now_iso()
         upd = {"status": req.status, "updated_at": now}
         if req.status == "interview_scheduled":
@@ -234,6 +399,9 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
               "kind": kind, "storage_path": res.get("path", path), "original_filename": (file.filename or "file")[:120],
               "content_type": ctype, "size": len(data), "is_deleted": False, "created_at": now_iso()}
         await db.tracker_evidence.insert_one(dict(ev))
+        if kind == "resume_viewed":
+            await db.job_tracker.update_one({"tracker_id": tracker_id, "resume_viewed_verification": None},
+                                            {"$set": {"resume_viewed_verification": "candidate_reported"}})
         return {"evidence_id": ev["evidence_id"], "kind": kind, "original_filename": ev["original_filename"]}
 
     # ------------------------------------------------------------------ reminders cron
@@ -284,7 +452,8 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
 
     # ------------------------------------------------------------------ admin
     async def filtered_records(start, end, industry, company, designation, job_id, location):
-        q: dict = {"archived": {"$ne": True}}
+        # JobRadar success analytics cover jobs found through JobRadar, not applications added by hand.
+        q: dict = {"archived": {"$ne": True}, "source": {"$ne": "external"}}
         rng = _range(start, end)
         if rng:
             q["created_at"] = rng
@@ -307,11 +476,14 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
             num = [t for t in den if b in (t.get("reached") or {})]
             conversions.append({"label": label, "explain": explain, "numerator": len(num), "denominator": len(den),
                                 "rate": round(len(num) * 100 / len(den), 1) if den else None})
+        rv = [t for t in records if t.get("resume_viewed_verification")]
         iv = [t for t in records if t.get("interview_verification")]
         hi = [t for t in records if t.get("hire_verification")]
         verification = {
             "interview_reported": len(iv), "interview_verified": sum(1 for t in iv if t["interview_verification"] == "verified"),
             "hire_reported": len(hi), "hire_verified": sum(1 for t in hi if t["hire_verification"] == "verified"),
+            "resume_viewed_reported": len(rv),
+            "resume_viewed_verified": sum(1 for t in rv if t["resume_viewed_verification"] == "verified"),
         }
         return {"totals": totals, "conversions": conversions, "verification": verification}
 
@@ -358,15 +530,29 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
 
     @r.post("/admin/success/{tracker_id}/verify")
     async def admin_verify(tracker_id: str, req: VerifyReq, admin=Depends(require_admin)):
-        if req.kind not in ("interview", "hire"):
+        if req.kind not in ("interview", "hire", "resume_viewed"):
             raise HTTPException(status_code=400, detail="Unknown outcome type")
         t = await db.job_tracker.find_one({"tracker_id": tracker_id}, {"_id": 0})
         if not t or not t.get(f"{req.kind}_verification"):
             raise HTTPException(status_code=400, detail="The candidate has not reported this outcome")
-        await db.job_tracker.update_one({"tracker_id": tracker_id}, {"$set": {
-            f"{req.kind}_verification": "verified" if req.verified else "candidate_reported",
-            f"{req.kind}_verified_by": admin["user_id"] if req.verified else None,
-            f"{req.kind}_verified_at": now_iso() if req.verified else None}})
+        now = now_iso()
+        upd = {f"{req.kind}_verification": "verified" if req.verified else "candidate_reported",
+               f"{req.kind}_verified_by": admin["user_id"] if req.verified else None,
+               f"{req.kind}_verified_at": now if req.verified else None}
+        push = None
+        if req.kind == "resume_viewed":
+            # Verified proof moves an early-stage application to Resume Viewed; removing it moves it back.
+            if req.verified and t["status"] in EARLY:
+                upd.update({"status": "resume_viewed", "updated_at": now, "reached.resume_viewed": now})
+                push = {"status": "resume_viewed", "at": now, "by": "admin"}
+            elif not req.verified and t["status"] == "resume_viewed":
+                prev = next((h["status"] for h in reversed(t.get("status_history") or []) if h["status"] != "resume_viewed"),
+                            "applied")
+                upd.update({"status": prev, "updated_at": now})
+                push = {"status": prev, "at": now, "by": "admin"}
+                await db.job_tracker.update_one({"tracker_id": tracker_id}, {"$unset": {"reached.resume_viewed": ""}})
+        await db.job_tracker.update_one({"tracker_id": tracker_id},
+                                        {"$set": upd, **({"$push": {"status_history": push}} if push else {})})
         return {"ok": True}
 
     @r.get("/admin/success/evidence/{evidence_id}")

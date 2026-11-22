@@ -398,6 +398,11 @@ class ActivityReq(BaseModel):
     job_id: str
 
 
+class JdCheckReq(BaseModel):
+    jd_text: Optional[str] = ""
+    job_id: Optional[str] = None
+
+
 class VerifyJobReq(BaseModel):
     verification_status: str
     note: Optional[str] = ""
@@ -672,7 +677,8 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
         if not st["enabled"]:
             return out
         since = (datetime.now(timezone.utc) - timedelta(days=st["max_job_age_days"])).isoformat()
-        rows = await db.job_matches.find({**scope, "match_score": {"$gte": st["min_score"]}, "status": {"$ne": "rejected"}},
+        rows = await db.job_matches.find({**scope, "match_score": {"$gte": st["min_score"]}, "status": {"$ne": "rejected"},
+                                          "mandatory_gap": {"$ne": True}},
                                          {"_id": 0, "match_id": 1, "candidate_id": 1, "job_id": 1, "match_score": 1,
                                           "explanation": 1}).sort("match_score", -1).to_list(5000)
         if not rows:
@@ -1400,7 +1406,11 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
     jobs_lock = asyncio.Lock()
     score_cache: Dict[str, tuple] = {}
     MATCH_KEYS = ("match_score", "category", "explanation", "missing_mandatory_skills", "provisional", "missing_data", "flags",
-                  "matched_skills")
+                  "matched_skills", "mandatory_gap")
+
+    def relevant(res: dict) -> bool:
+        """Shown as a recommendation: Strong or Potential Match with no missing mandatory skill."""
+        return res["match_score"] >= 65 and not res.get("mandatory_gap")
 
     async def eligible_jobs() -> tuple:
         async with jobs_lock:
@@ -1465,8 +1475,8 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
             return j.get("date_published") or j.get("date_added") or ""
 
         recent = [card(jid) for jid in sorted((jid for jid in jobs if pub(jid) >= recent_cut), key=pub, reverse=True)[:12]]
-        ranked = [card(jid) for jid in [x for x in ranked_ids if scores[x]["match_score"] >= 65][:12]]
-        strong = [card(jid) for jid in [x for x in ranked_ids if scores[x]["match_score"] >= 80][:12]]
+        ranked = [card(jid) for jid in [x for x in ranked_ids if relevant(scores[x])][:12]]
+        strong = [card(jid) for jid in [x for x in ranked_ids if relevant(scores[x]) and scores[x]["match_score"] >= 80][:12]]
         viewed_ids, seen = [], set()
         for a in await db.candidate_job_activity.find({"candidate_id": uid, "type": "view"}, {"_id": 0, "job_id": 1}).sort("at", -1).to_list(200):
             if a["job_id"] not in seen:
@@ -1487,6 +1497,59 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
             "viewed": [cards[i] for i in viewed_ids if i in cards][:12], "shared": shared,
             "unread": sum(1 for n in notes if not n.get("read_at")),
         }
+
+    @r.get("/smartmatch/feed")
+    async def matched_feed(q: str = "", industry_category: str = "All", region: str = "All", work_mode: str = "All",
+                           employment_type: str = "All", location: str = "", designation: str = "",
+                           min_salary: Optional[float] = None, max_experience: Optional[float] = None,
+                           user=Depends(get_current_user)):
+        """Default job feed for a signed-in candidate: only Strong and Potential matches without missing mandatory
+        skills. Filters narrow this list further; they never add unrelated jobs."""
+        if user.get("role") != "candidate":
+            raise HTTPException(status_code=403, detail="Only candidates have a matched feed")
+        uid = user["user_id"]
+        is_member = (await compute_membership(uid))["is_active"]
+        jobs, scores = await my_scores(user, await related_pairs())
+        not_int = set(await db.candidate_job_activity.distinct("job_id", {"candidate_id": uid, "type": "not_interested"}))
+        saved_ids = set(await db.saved_jobs.distinct("job_id", {"candidate_id": uid}))
+        ql, loc, des = q.strip().lower(), location.strip().lower(), designation.strip().lower()
+
+        def keep(j: dict) -> bool:
+            text = " ".join(str(j.get(k) or "") for k in ("title", "company", "required_skills", "designation")).lower()
+            place = " ".join(str(j.get(k) or "") for k in ("location", "city", "country")).lower()
+            sal = to_num(j.get("salary_max")) or to_num(j.get("salary_min"))
+            return ((not ql or ql in text) and (industry_category == "All" or j.get("industry_category") == industry_category)
+                    and (region == "All" or j.get("region") == region) and (work_mode == "All" or j.get("work_mode") == work_mode)
+                    and (employment_type == "All" or j.get("employment_type") == employment_type)
+                    and (not loc or loc in place) and (not des or des in (j.get("title") or "").lower())
+                    and (min_salary is None or (sal is not None and sal >= min_salary))
+                    and (max_experience is None or (to_num(j.get("experience_min")) or 0) <= max_experience))
+
+        live = {jid: j for jid, j in jobs.items() if not job_ineligible_reason(j) and jid not in not_int}
+        rel = [jid for jid in live if relevant(scores[jid])]
+        shown = sorted((jid for jid in rel if keep(live[jid])), key=lambda jid: -scores[jid]["match_score"])[:60]
+        return {"jobs": [{**serialize_job(live[jid], is_member, jid in saved_ids), "match": dict(scores[jid])} for jid in shown],
+                "relevant_total": len(rel), "hidden_unrelated": len(live) - len(rel), "profile": profile_status(user)}
+
+    @r.post("/smartmatch/jd-check")
+    async def jd_check(req: JdCheckReq, user=Depends(get_current_user)):
+        """Candidate's own check of a job description against their confirmed profile, using the SmartMatch rules."""
+        from jd_match import check
+        if user.get("role") != "candidate":
+            raise HTTPException(status_code=403, detail="Only candidates can run a JD match check")
+        job = None
+        if req.job_id:
+            job = await db.jobs.find_one({"job_id": req.job_id, "status": "Published"}, {"_id": 0})
+            if not job:
+                raise HTTPException(404, "Job not found")
+        text = (req.jd_text or "").strip()[:12000]
+        if not job and len(text) < 80:
+            raise HTTPException(400, "Please paste the complete job description (at least 80 characters)")
+        out = await asyncio.to_thread(check, text, user, await related_pairs(), await weights(), job)
+        await db.candidate_job_activity.insert_one({"candidate_id": user["user_id"], "type": "jd_check",
+                                                    "job_id": req.job_id, "score": out["score"], "at": now_iso()})
+        return {**out, "profile": profile_status(user),
+                "disclaimer": "An advisory indicator based on your confirmed profile, not a prediction of selection."}
 
     def invalidate_jobs():
         jobs_cache["at"] = 0.0

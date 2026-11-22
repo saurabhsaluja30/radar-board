@@ -25,13 +25,14 @@ from pymongo import ReturnDocument
 
 import storage
 from career import file_to_text
+from doctext import is_doc
 from resume_parse import extract, keywords
 from smartmatch import NOTICE_DAYS, norm_skill, profile_status
 
 logger = logging.getLogger("jobradar.resumes")
 
 DEFAULT_SETTINGS = {"uploads_enabled": False, "max_mb": 2.0, "outdated_months": 12}
-TYPES = {"pdf": "application/pdf", "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
+TYPES = {"pdf": "application/pdf", "doc": "application/msword", "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
 MAX_ATTEMPTS = 3
 LOCK_MINUTES = 5
 RETRY_BATCH = 10
@@ -102,7 +103,7 @@ def _coerce(field: str, kind: str, v):
 
 
 def validate_file(name: str, data: bytes) -> str:
-    """Return "pdf" or "docx", or raise 400. Checks real file content, not just the name."""
+    """Return "pdf", "doc" or "docx", or raise 400. Checks real file content, not just the name."""
     if data[:5] == b"%PDF-":
         head = data[:400000]
         if re.search(rb"/Encrypt\b", head):
@@ -124,7 +125,21 @@ def validate_file(name: str, data: bytes) -> str:
         if any(n.lower().endswith("vbaproject.bin") for n in names):
             raise HTTPException(400, "Word files with macros can't be accepted. Please save as a normal .docx.")
         return "docx"
-    raise HTTPException(400, "Please upload a PDF or Word (.docx) file. Older .doc files: save as .docx first.")
+    if is_doc(data):
+        import olefile
+        try:
+            with olefile.OleFileIO(io.BytesIO(data)) as ole:
+                streams = ["/".join(s).lower() for s in ole.listdir()]
+                if not ole.exists("WordDocument"):
+                    raise HTTPException(400, "Please upload a PDF or Word (.doc or .docx) file.")
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(400, "This Word file is damaged. Please upload a valid .doc or .docx file.")
+        if any(s.startswith("macros") or "vba" in s for s in streams):
+            raise HTTPException(400, "Word files with macros can't be accepted. Please save as a normal .docx.")
+        return "doc"
+    raise HTTPException(400, "Please upload a PDF or Word (.doc or .docx) file.")
 
 
 def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on_profile_change=None):
