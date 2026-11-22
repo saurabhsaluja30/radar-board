@@ -137,7 +137,7 @@ export function Register() {
         <Input className="sm:col-span-2" label="Full Name *" placeholder="Your name" {...bind("full_name")} data-testid="reg-name" />
         <Input label="Email *" type="email" placeholder="you@example.com" {...bind("email")} data-testid="reg-email" />
         <Input label="Mobile Number *" placeholder="10-digit mobile" {...bind("mobile")} data-testid="reg-mobile" />
-        <Input label="Password *" type="password" placeholder="Min 6 characters" {...bind("password")} data-testid="reg-password" />
+        <Input label="Password *" type="password" placeholder="Min 8 characters, letters and numbers" {...bind("password")} data-testid="reg-password" />
         <Input label="Confirm Password *" type="password" placeholder="Re-enter password" {...bind("confirm_password")} data-testid="reg-confirm" />
       </div>
       <div className="mt-5 space-y-5">
@@ -246,7 +246,7 @@ export function Forgot() {
         ) : (
           <>
             <Input label="Reset Code" value={token} onChange={(e) => setToken(e.target.value)} placeholder="8-character code" data-testid="reset-code" />
-            <Input label="New Password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Min 6 characters" data-testid="reset-password" />
+            <Input label="New Password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Min 8 characters, letters and numbers" data-testid="reset-password" />
             <Button full title="Reset Password" loading={loading} onClick={reset} data-testid="reset-submit" />
           </>
         )}

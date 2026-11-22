@@ -6,6 +6,7 @@ stored bytes permanently unreadable, and delete_object additionally overwrites t
 
 STORAGE_BACKEND=local writes to a folder instead; it is for local development and tests only.
 """
+import base64
 import os
 from pathlib import Path
 
@@ -118,3 +119,37 @@ def encrypt(key: bytes, data: bytes) -> bytes:
 
 def decrypt(key: bytes, blob: bytes) -> bytes:
     return AESGCM(key).decrypt(blob[:12], blob[12:], None)
+
+
+# --------------------------------------------------------------------------- key wrapping
+# Per-file keys are stored in MongoDB wrapped (encrypted) with a master key from the RESUME_KEK secret, so a copy
+# of the database alone cannot decrypt resume files: an attacker also needs the server's environment.
+# RESUME_KEK is 32 random bytes, base64 encoded:  python -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"
+def kek() -> bytes | None:
+    raw = (os.environ.get("RESUME_KEK") or "").strip()
+    if not raw:
+        return None
+    key = base64.b64decode(raw)
+    if len(key) != 32:
+        raise ValueError("RESUME_KEK must be 32 bytes, base64 encoded")
+    return key
+
+
+def wrap_key(key: bytes) -> str:
+    master = kek()
+    if not master:
+        raise RuntimeError("RESUME_KEK is not configured")
+    return base64.b64encode(encrypt(master, key)).decode()
+
+
+def unwrap_key(rec: dict) -> bytes | None:
+    """The file key for a resume record: wrapped keys need RESUME_KEK; records from before wrapping still carry a
+    plain `enc_key` until the startup migration wraps them. None once the key has been destroyed."""
+    if rec.get("enc_key_wrapped"):
+        master = kek()
+        if not master:
+            raise RuntimeError("RESUME_KEK is not configured")
+        return decrypt(master, base64.b64decode(rec["enc_key_wrapped"]))
+    if rec.get("enc_key"):
+        return base64.b64decode(rec["enc_key"])
+    return None

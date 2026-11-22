@@ -12,6 +12,9 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
+import hashlib
+import secrets
+
 import bcrypt
 import httpx
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, Query, Request
@@ -19,6 +22,9 @@ from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr, Field
+from pymongo import ReturnDocument
+
+import ratelimit as _rl
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -241,6 +247,14 @@ def check_pw(pw: str, hashed: str) -> bool:
         return bcrypt.checkpw(pw.encode(), hashed.encode())
     except Exception:
         return False
+
+
+# Old builds seeded the admin with this password. It is kept only to detect and rotate it at startup.
+LEGACY_ADMIN_PASSWORD = "Admin@12345"
+
+
+def _env_flag(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def parse_dt(v) -> Optional[datetime]:
@@ -596,12 +610,27 @@ class AnnouncementReq(BaseModel):
 # ===========================================================================
 # AUTH ROUTES
 # ===========================================================================
-@api.post("/auth/register")
+MIN_PASSWORD = 8
+RESET_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I so codes are easy to type
+RESET_MAX_ATTEMPTS = 5
+
+
+def _check_password_strength(pw: str) -> None:
+    if len(pw or "") < MIN_PASSWORD:
+        raise HTTPException(status_code=400, detail=f"Password must be at least {MIN_PASSWORD} characters")
+    if pw.isdigit() or pw.isalpha():
+        raise HTTPException(status_code=400, detail="Password must contain both letters and numbers")
+
+
+def _hash_reset_code(code: str) -> str:
+    return hashlib.sha256(code.strip().upper().encode()).hexdigest()
+
+
+@api.post("/auth/register", dependencies=[Depends(_rl.limit("register", 30, 3600))])
 async def register(req: RegisterReq):
     if req.password != req.confirm_password:
         raise HTTPException(status_code=400, detail="Passwords do not match")
-    if len(req.password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    _check_password_strength(req.password)
     if not req.consent:
         raise HTTPException(status_code=400, detail="You must accept the Terms and Privacy Policy")
     for _f, _label in (("industry", "Industry"), ("current_designation", "Current Designation"),
@@ -655,8 +684,9 @@ async def register(req: RegisterReq):
     return {"token": token, "user": user}
 
 
-@api.post("/auth/login")
+@api.post("/auth/login", dependencies=[Depends(_rl.limit("login", 20, 300))])
 async def login(req: LoginReq):
+    _rl.check(f"login:email:{req.email.lower()}", 10, 900)
     user = await db.users.find_one({"email": req.email.lower()})
     if not user or not user.get("password") or not check_pw(req.password, user["password"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
@@ -667,8 +697,9 @@ async def login(req: LoginReq):
     return {"token": token, "user": safe}
 
 
-@api.post("/auth/admin/login")
+@api.post("/auth/admin/login", dependencies=[Depends(_rl.limit("admin_login", 10, 300))])
 async def admin_login(req: LoginReq):
+    _rl.check(f"admin_login:email:{req.email.lower()}", 5, 900)
     user = await db.users.find_one({"email": req.email.lower(), "role": "admin"})
     if not user or not check_pw(req.password, user.get("password", "")):
         raise HTTPException(status_code=401, detail="Invalid admin credentials")
@@ -677,7 +708,7 @@ async def admin_login(req: LoginReq):
     return {"token": token, "user": safe}
 
 
-@api.post("/auth/session")
+@api.post("/auth/session", dependencies=[Depends(_rl.limit("google_session", 20, 300))])
 async def google_session(req: SessionReq):
     async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
@@ -688,8 +719,16 @@ async def google_session(req: SessionReq):
         raise HTTPException(status_code=401, detail="Invalid session")
     data = resp.json()
     email = (data.get("email") or "").lower()
+    if not email:
+        raise HTTPException(status_code=401, detail="Invalid session")
     existing = await db.users.find_one({"email": email})
     if existing:
+        # Google verifies the address, so linking a candidate account by email is safe. Admin accounts must
+        # use the admin password login, and suspended accounts stay locked out.
+        if existing.get("role") == "admin":
+            raise HTTPException(status_code=403, detail="Admins must sign in with the admin login")
+        if existing.get("suspended"):
+            raise HTTPException(status_code=403, detail="Your account has been suspended")
         user_id = existing["user_id"]
         await db.users.update_one({"user_id": user_id}, {"$set": {
             "picture": data.get("picture"), "updated_at": now_iso()}})
@@ -727,13 +766,17 @@ async def logout(authorization: Optional[str] = Header(None)):
     return {"success": True}
 
 
-@api.post("/auth/forgot-password")
+@api.post("/auth/forgot-password", dependencies=[Depends(_rl.limit("forgot", 5, 900))])
 async def forgot_password(req: ForgotReq):
+    _rl.check(f"forgot:email:{req.email.lower()}", 3, 3600)
     user = await db.users.find_one({"email": req.email.lower()})
     if user and user.get("auth_provider") == "password":
-        token = f"{uuid.uuid4().hex[:8].upper()}"
-        await db.users.update_one({"user_id": user["user_id"]}, {"$set": {
-            "reset_token": token, "reset_expires": (now_utc() + timedelta(hours=1)).isoformat()}})
+        token = "".join(secrets.choice(RESET_CODE_ALPHABET) for _ in range(8))
+        # Only a hash is stored, so a database leak does not expose live reset codes.
+        await db.users.update_one({"user_id": user["user_id"]}, {
+            "$set": {"reset_token_hash": _hash_reset_code(token), "reset_attempts": 0,
+                     "reset_expires": (now_utc() + timedelta(hours=1)).isoformat()},
+            "$unset": {"reset_token": ""}})
         inner = (f'<p style="color:#374151;font-size:15px">Hi {escape(user.get("full_name") or "there")},</p>'
                  '<p style="color:#374151;font-size:15px">Use the code below to reset your password. '
                  'It expires in 1 hour.</p>'
@@ -744,19 +787,30 @@ async def forgot_password(req: ForgotReq):
     return {"success": True, "message": "If an account exists, a reset code has been sent."}
 
 
-@api.post("/auth/reset-password")
+@api.post("/auth/reset-password", dependencies=[Depends(_rl.limit("reset", 10, 900))])
 async def reset_password(req: ResetReq):
     user = await db.users.find_one({"email": req.email.lower()})
-    if not user or user.get("reset_token") != req.token:
+    stored = (user or {}).get("reset_token_hash")
+    if not user or not stored:
         raise HTTPException(status_code=400, detail="Invalid or expired reset code")
     exp = parse_dt(user.get("reset_expires"))
     if not exp or exp < now_utc():
         raise HTTPException(status_code=400, detail="Reset code has expired")
-    if len(req.new_password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    if not hmac.compare_digest(stored, _hash_reset_code(req.token or "")):
+        # Count wrong guesses; after RESET_MAX_ATTEMPTS the code is burned and a new one must be requested.
+        res = await db.users.find_one_and_update({"user_id": user["user_id"]}, {"$inc": {"reset_attempts": 1}},
+                                                 return_document=ReturnDocument.AFTER)
+        if (res or {}).get("reset_attempts", 0) >= RESET_MAX_ATTEMPTS:
+            await db.users.update_one({"user_id": user["user_id"]},
+                                      {"$unset": {"reset_token_hash": "", "reset_expires": "", "reset_attempts": ""}})
+            raise HTTPException(status_code=400, detail="Too many wrong codes. Please request a new reset code.")
+        raise HTTPException(status_code=400, detail="Invalid or expired reset code")
+    _check_password_strength(req.new_password)
     await db.users.update_one({"user_id": user["user_id"]}, {
         "$set": {"password": hash_pw(req.new_password), "updated_at": now_iso()},
-        "$unset": {"reset_token": "", "reset_expires": ""}})
+        "$unset": {"reset_token_hash": "", "reset_expires": "", "reset_attempts": "", "reset_token": ""}})
+    # A password reset signs the account out everywhere.
+    await db.user_sessions.delete_many({"user_id": user["user_id"]})
     return {"success": True}
 
 
@@ -765,8 +819,7 @@ async def change_password(req: ChangePwReq, user=Depends(get_current_user)):
     full = await db.users.find_one({"user_id": user["user_id"]})
     if not full.get("password") or not check_pw(req.current_password, full["password"]):
         raise HTTPException(status_code=400, detail="Current password is incorrect")
-    if len(req.new_password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    _check_password_strength(req.new_password)
     await db.users.update_one({"user_id": user["user_id"]},
                               {"$set": {"password": hash_pw(req.new_password), "updated_at": now_iso()}})
     return {"success": True}
@@ -1037,7 +1090,13 @@ async def _activate_subscription(candidate_id: str, plan: dict, is_demo: bool, p
     - Same plan while active  -> renewal: new duration is added after the current expiry.
     - Different plan while active -> upgrade/change: new plan starts today and replaces the old one
       (expiry = today + new plan duration; durations are NOT stacked).
-    - No active plan -> starts today."""
+    - No active plan -> starts today.
+    Idempotent per payment: if this payment already created a subscription (for example a retry after a crash
+    mid-activation), that subscription is returned instead of adding the plan a second time."""
+    if payment_id:
+        done = await db.subscriptions.find_one({"payment_id": payment_id}, {"_id": 0, "subscription_id": 1})
+        if done:
+            return {**await compute_membership(candidate_id), "subscription_id": done["subscription_id"]}
     current = await compute_membership(candidate_id)
     duration = int(plan["duration_days"])
     # Buying a plan of the same length counts as a renewal even when the plan record changed (for example a
@@ -1066,9 +1125,9 @@ async def _activate_subscription(candidate_id: str, plan: dict, is_demo: bool, p
         "status": "active", "is_demo": is_demo, "payment_id": payment_id,
         "is_renewal": renewal, "is_upgrade": is_upgrade,
         "upgraded_from": current.get("plan_id") if is_upgrade else None, "reminders_sent": [],
-        "created_at": now_iso(), "updated_at": now_iso(),
+        "duration_days": duration, "created_at": now_iso(), "updated_at": now_iso(),
     })
-    return await compute_membership(candidate_id)
+    return {**await compute_membership(candidate_id), "subscription_id": sub_id}
 
 
 # ---------------------------------------------------------------------------
@@ -1683,8 +1742,15 @@ async def _send_reminder(candidate_id: str, days: int):
     return True
 
 
+async def require_dev_tools(admin=Depends(require_admin)):
+    """The developer panel fakes payments and expiries, so it only exists when ENABLE_DEV_TOOLS is on."""
+    if not _env_flag("ENABLE_DEV_TOOLS"):
+        raise HTTPException(status_code=404, detail="Developer tools are turned off on this server")
+    return admin
+
+
 @api.post("/admin/dev/action")
-async def dev_action(req: DevActionReq, admin=Depends(require_admin)):
+async def dev_action(req: DevActionReq, admin=Depends(require_dev_tools)):
     cid = req.candidate_id
     action = req.action
     user = await db.users.find_one({"user_id": cid}, {"_id": 0})
@@ -1783,7 +1849,7 @@ async def dev_action(req: DevActionReq, admin=Depends(require_admin)):
 
 
 @api.get("/admin/dev/candidates")
-async def dev_candidates(admin=Depends(require_admin)):
+async def dev_candidates(admin=Depends(require_dev_tools)):
     users = await db.users.find({"role": "candidate"}, {"_id": 0, "user_id": 1, "full_name": 1, "email": 1}).sort("created_at", -1).to_list(1000)
     ms = await compute_memberships([u["user_id"] for u in users])
     out = []
@@ -1877,14 +1943,16 @@ async def seed():
         await db.jobs.update_many({"function": _src, "industry_category": {"$exists": False}},
                                   {"$set": {"industry_category": _dst}})
     await db.jobs.update_many({"industry_category": {"$exists": False}}, {"$set": {"industry_category": "Other"}})
-    await _seed_international_jobs()
+    if _env_flag("SEED_DEMO_DATA"):
+        await _seed_international_jobs()
     # Career Tools plan limits (per plan purchase). Only filled in when missing, so admin changes are kept.
     for _tier, _n in (("monthly", 8), ("quarterly", 15), ("half_yearly", 25), ("annual", 40)):
         await db.career_settings.update_one(
             {"settings_id": "career", f"limits.{_tier}": {"$exists": False}},
             {"$set": {f"limits.{_tier}": {"resume_generation": _n, "resume_analysis": _n, "interview_sessions": _n}}})
 
-    if await db.jobs.count_documents({}) == 0:
+    # Demo jobs and the demo candidate only appear when SEED_DEMO_DATA is on (development and test servers).
+    if _env_flag("SEED_DEMO_DATA") and await db.jobs.count_documents({}) == 0:
         for i, (title, company, func, sub, ind, loc, exp, sal, mode) in enumerate(SAMPLE_JOBS):
             await db.jobs.insert_one({
                 "job_id": f"job_{uuid.uuid4().hex[:10]}", "title": title, "company": company,
@@ -1912,17 +1980,37 @@ async def seed():
                 "views": 0, "saves": 0, "apply_clicks": 0})
         logger.info("Seeded sample jobs")
 
-    admin_email = "admin@eevolvex.com"
-    if not await db.users.find_one({"email": admin_email}):
-        await db.users.insert_one({
-            "user_id": f"user_{uuid.uuid4().hex[:12]}", "email": admin_email,
-            "full_name": "Evolveminds Admin", "mobile": None, "password": hash_pw("Admin@12345"),
-            "role": "admin", "auth_provider": "password", "picture": None, "consent": True,
-            "suspended": False, "created_at": now_iso(), "updated_at": now_iso(), "status": "active"})
-        logger.info("Seeded admin user")
+    # The first admin comes from the environment, never from a password in the source code.
+    admin_email = (os.environ.get("ADMIN_EMAIL") or "admin@eevolvex.com").strip().lower()
+    admin_pw = (os.environ.get("ADMIN_PASSWORD") or "").strip()
+    existing_admin = await db.users.find_one({"email": admin_email})
+    if not existing_admin:
+        if admin_pw:
+            await db.users.insert_one({
+                "user_id": f"user_{uuid.uuid4().hex[:12]}", "email": admin_email,
+                "full_name": "Evolveminds Admin", "mobile": None, "password": hash_pw(admin_pw),
+                "role": "admin", "is_owner": True, "auth_provider": "password", "picture": None, "consent": True,
+                "suspended": False, "created_at": now_iso(), "updated_at": now_iso(), "status": "active"})
+            logger.info("Seeded admin user from ADMIN_EMAIL / ADMIN_PASSWORD")
+        else:
+            logger.warning("No admin account exists and ADMIN_PASSWORD is not set; set it to create the first admin")
+    elif existing_admin.get("password") and check_pw(LEGACY_ADMIN_PASSWORD, existing_admin["password"]):
+        # Older builds seeded a well-known password. Rotate it when a new one is configured; otherwise shout.
+        if admin_pw and admin_pw != LEGACY_ADMIN_PASSWORD:
+            await db.users.update_one({"user_id": existing_admin["user_id"]},
+                                      {"$set": {"password": hash_pw(admin_pw), "updated_at": now_iso()}})
+            await db.user_sessions.delete_many({"user_id": existing_admin["user_id"]})
+            logger.info("Rotated the default admin password to ADMIN_PASSWORD")
+        else:
+            logger.error("SECURITY: the admin account still uses the old default password. Set ADMIN_PASSWORD.")
+    # Exactly one admin is the owner (full access, including candidate data exports).
+    if not await db.users.find_one({"role": "admin", "is_owner": True}, {"_id": 1}):
+        first = await db.users.find_one({"role": "admin"}, {"_id": 0, "user_id": 1}, sort=[("created_at", 1)])
+        if first:
+            await db.users.update_one({"user_id": first["user_id"]}, {"$set": {"is_owner": True}})
 
     test_email = "test@jobradar.com"
-    if not await db.users.find_one({"email": test_email}):
+    if _env_flag("SEED_DEMO_DATA") and not await db.users.find_one({"email": test_email}):
         await db.users.insert_one({
             "user_id": f"user_{uuid.uuid4().hex[:12]}", "email": test_email,
             "full_name": "Test Candidate", "mobile": "9999999999", "password": hash_pw("Test@12345"),
@@ -1938,75 +2026,103 @@ async def seed():
 
 @app.on_event("startup")
 async def startup():
-    try:
-        await db.users.create_index("email", unique=True)
-        await db.users.create_index("user_id", unique=True)
-        await db.user_sessions.create_index("session_token", unique=True)
-        await db.jobs.create_index("job_id", unique=True)
-        await db.job_tracker.create_index([("candidate_id", 1), ("job_id", 1)], unique=True)
-        await db.job_tracker.create_index("tracker_id", unique=True)
-        await db.tracker_evidence.create_index("tracker_id")
-        await db.cron_runs.create_index("run_id", unique=True)
-        await db.job_matches.create_index([("candidate_id", 1), ("job_id", 1)], unique=True)
-        await db.job_matches.create_index("match_id", unique=True)
-        await db.job_matches.create_index([("job_id", 1), ("match_score", -1)])
-        await db.job_notifications.create_index([("candidate_id", 1), ("job_id", 1), ("channel", 1)], unique=True)
-        await db.match_reviews.create_index("match_id")
-        await db.candidate_job_activity.create_index([("candidate_id", 1), ("at", -1)])
-        await db.admin_audit_log.create_index([("at", -1)])
+    # Each index is created on its own: one failure (for example duplicate data blocking a unique index) is
+    # logged and the remaining indexes are still built.
+    failed = 0
+    for spec in _index_specs():
+        coll, keys, kw = spec
+        try:
+            await db[coll].create_index(keys, **kw)
+        except Exception as e:  # noqa: BLE001
+            failed += 1
+            logger.error(f"Index {coll} {keys} not created: {e}")
+    for name, fn in (("ops", _ops.ensure_indexes), ("payments", _payment_indexes)):
+        try:
+            await fn(db)
+        except Exception as e:  # noqa: BLE001
+            failed += 1
+            logger.error(f"{name} indexes not created: {e}")
+    if failed:
+        logger.error(f"{failed} index(es) failed; see the errors above")
+    await _startup_rest()
+
+
+def _index_specs() -> list:
+    """(collection, keys, options) for every index the app relies on."""
+    return [
+        ("users", "email", {"unique": True}),
+        ("users", "user_id", {"unique": True}),
+        ("user_sessions", "session_token", {"unique": True}),
+        ("jobs", "job_id", {"unique": True}),
+        ("job_tracker", [("candidate_id", 1), ("job_id", 1)], {"unique": True}),
+        ("job_tracker", "tracker_id", {"unique": True}),
+        ("tracker_evidence", "tracker_id", {}),
+        ("cron_runs", "run_id", {"unique": True}),
+        ("job_matches", [("candidate_id", 1), ("job_id", 1)], {"unique": True}),
+        ("job_matches", "match_id", {"unique": True}),
+        ("job_matches", [("job_id", 1), ("match_score", -1)], {}),
+        ("job_notifications", [("candidate_id", 1), ("job_id", 1), ("channel", 1)], {"unique": True}),
+        ("match_reviews", "match_id", {}),
+        ("candidate_job_activity", [("candidate_id", 1), ("at", -1)], {}),
+        ("admin_audit_log", [("at", -1)], {}),
         # Hot-path lookups that previously scanned whole collections.
-        await db.jobs.create_index([("status", 1), ("verification_status", 1), ("date_added", -1)])
-        await db.jobs.create_index([("status", 1), ("expiry_date", 1)])
-        await db.subscriptions.create_index([("candidate_id", 1), ("created_at", -1)])
-        await db.saved_jobs.create_index([("candidate_id", 1), ("created_at", -1)])
-        await db.payments.create_index([("candidate_id", 1), ("created_at", -1)])
-        await db.users.create_index([("role", 1), ("created_at", -1)])
-        await db.user_sessions.create_index("user_id")
-        await db.email_logs.create_index([("delivery_status", 1), ("date_sent", 1)])
-        await db.email_logs.create_index([("created_at", -1)])
-        await db.job_notifications.create_index([("job_id", 1), ("status", 1)])
-        await db.job_notifications.create_index([("candidate_id", 1), ("channel", 1), ("sent_at", -1)])
-        await db.job_matches.create_index([("candidate_id", 1), ("status", 1)])
-        await db.candidate_job_activity.create_index([("candidate_id", 1), ("type", 1)])
-        await db.tracker_evidence.create_index([("tracker_id", 1), ("is_deleted", 1)])
+        ("jobs", [("status", 1), ("verification_status", 1), ("date_added", -1)], {}),
+        ("jobs", [("status", 1), ("expiry_date", 1)], {}),
+        ("subscriptions", [("candidate_id", 1), ("created_at", -1)], {}),
+        ("subscriptions", "payment_id", {}),
+        ("saved_jobs", [("candidate_id", 1), ("created_at", -1)], {}),
+        ("payments", [("candidate_id", 1), ("created_at", -1)], {}),
+        ("users", [("role", 1), ("created_at", -1)], {}),
+        ("user_sessions", "user_id", {}),
+        ("email_logs", [("delivery_status", 1), ("date_sent", 1)], {}),
+        ("email_logs", [("created_at", -1)], {}),
+        ("job_notifications", [("job_id", 1), ("status", 1)], {}),
+        ("job_notifications", [("candidate_id", 1), ("channel", 1), ("sent_at", -1)], {}),
+        ("job_matches", [("candidate_id", 1), ("status", 1)], {}),
+        ("candidate_job_activity", [("candidate_id", 1), ("type", 1)], {}),
+        ("tracker_evidence", [("tracker_id", 1), ("is_deleted", 1)], {}),
         # Resumes + talent database
-        await db.candidate_resumes.create_index("resume_id", unique=True)
-        await db.candidate_resumes.create_index([("candidate_id", 1), ("is_current", 1)])
-        await db.candidate_resumes.create_index([("status", 1), ("lock_until", 1)])
-        await db.candidate_resumes.create_index([("candidate_id", 1), ("sha256", 1)])
-        await db.users.create_index([("talent_db_consent", 1), ("role", 1), ("created_at", -1)])
-        await db.users.create_index("resume_keywords")
-        await db.users.create_index("tools")
-        await db.users.create_index("certifications")
-        await db.users.create_index("current_location")
-        await db.users.create_index("has_resume")
-        await db.users.create_index([("role", 1), ("current_designation", 1)])
+        ("candidate_resumes", "resume_id", {"unique": True}),
+        ("candidate_resumes", [("candidate_id", 1), ("is_current", 1)], {}),
+        ("candidate_resumes", [("status", 1), ("lock_until", 1)], {}),
+        ("candidate_resumes", [("candidate_id", 1), ("sha256", 1)], {}),
+        ("users", [("talent_db_consent", 1), ("role", 1), ("created_at", -1)], {}),
+        ("users", "resume_keywords", {}),
+        ("users", "tools", {}),
+        ("users", "certifications", {}),
+        ("users", "current_location", {}),
+        ("users", "has_resume", {}),
+        ("users", [("role", 1), ("current_designation", 1)], {}),
         # Apify job discovery
-        await db.jobs.create_index("original_url", unique=True, partialFilterExpression={"original_url": {"$type": "string"}})
-        await db.jobs.create_index("dedupe_key")
-        await db.jobs.create_index([("imported_via", 1), ("review_status", 1), ("imported_at", -1)])
-        await db.jobs.create_index("source_id")
-        await db.job_sources.create_index("source_id", unique=True)
-        await db.apify_runs.create_index("run_id", unique=True)
-        await db.apify_runs.create_index("apify_run_id")
-        await db.apify_runs.create_index([("processed", 1), ("started_at", -1)])
-        await db.job_import_logs.create_index([("job_id", 1), ("at", -1)])
-        await db.job_import_logs.create_index("original_url")
-        await db.job_import_logs.create_index("at_dt", expireAfterSeconds=180 * 24 * 3600)
+        ("jobs", "original_url", {"unique": True, "partialFilterExpression": {"original_url": {"$type": "string"}}}),
+        ("jobs", "dedupe_key", {}),
+        ("jobs", [("imported_via", 1), ("review_status", 1), ("imported_at", -1)], {}),
+        ("jobs", "source_id", {}),
+        ("job_sources", "source_id", {"unique": True}),
+        ("apify_runs", "run_id", {"unique": True}),
+        ("apify_runs", "apify_run_id", {}),
+        ("apify_runs", [("processed", 1), ("started_at", -1)], {}),
+        ("job_import_logs", [("job_id", 1), ("at", -1)], {}),
+        ("job_import_logs", "original_url", {}),
+        ("job_import_logs", "at_dt", {"expireAfterSeconds": 180 * 24 * 3600}),
         # SmartMatch queue: one queued item per job/candidate at a time; finished items kept 7 days.
-        await db.match_queue.create_index([("kind", 1), ("ref_id", 1)], unique=True, partialFilterExpression={"status": "queued"},
-                                          name="one_queued_per_ref")
-        await db.match_queue.create_index([("status", 1), ("created_at", 1)])
-        await db.match_queue.create_index("queue_id", unique=True)
-        await db.match_queue.create_index("done_at", expireAfterSeconds=7 * 24 * 3600)
-        await _ops.ensure_indexes(db)
-        await _payment_indexes(db)
+        ("match_queue", [("kind", 1), ("ref_id", 1)], {"unique": True, "partialFilterExpression": {"status": "queued"},
+                                                       "name": "one_queued_per_ref"}),
+        ("match_queue", [("status", 1), ("created_at", 1)], {}),
+        ("match_queue", "queue_id", {"unique": True}),
+        ("match_queue", "done_at", {"expireAfterSeconds": 7 * 24 * 3600}),
         # Resume tailoring proposals: reviewed within days; unapproved ones are removed after 7 days.
-        await db.tailor_drafts.create_index("draft_id", unique=True)
-        await db.tailor_drafts.create_index("created_dt", expireAfterSeconds=7 * 24 * 3600)
-    except Exception as e:
-        logger.warning(f"Index creation: {e}")
+        ("tailor_drafts", "draft_id", {"unique": True}),
+        ("tailor_drafts", "created_dt", {"expireAfterSeconds": 7 * 24 * 3600}),
+    ]
+
+
+async def _startup_rest():
     await seed()
+    try:
+        await _resume_helpers["wrap_legacy_keys"]()
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Resume key wrapping failed: {e}")
     # One-time backfill: duplicate detection compares imports against every job's company/title/location key.
     async for j in db.jobs.find({"dedupe_key": {"$exists": False}}, {"_id": 0, "job_id": 1, "company": 1, "title": 1, "location": 1}):
         await db.jobs.update_one({"job_id": j["job_id"]}, {"$set": {"dedupe_key": _dedupe_key(j.get("company"), j.get("title"), j.get("location"))}})
@@ -2065,10 +2181,13 @@ _ops_router, _ = _ops.build_router(db, require_admin, live_job_q)
 api.include_router(_ops_router)
 app.include_router(api)
 app.add_middleware(_ops.MetricsMiddleware)
+# Auth uses a Bearer token header, not cookies, so credentialed CORS is not needed. CORS_ORIGINS (comma separated)
+# limits which sites may call the API from a browser; unset means any origin, but without credentials.
+_cors = [o.strip().rstrip("/") for o in (os.environ.get("CORS_ORIGINS") or "").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=["*"],
+    allow_credentials=bool(_cors),
+    allow_origins=_cors or ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )

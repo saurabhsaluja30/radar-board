@@ -92,7 +92,7 @@ export function AdminDevPanel() {
   const qc = useQueryClient();
   const [selected, setSelected] = useState(null);
   const [busy, setBusy] = useState(null);
-  const { data, refetch } = useQuery({ queryKey: ["dev-candidates"], queryFn: () => api("/admin/dev/candidates") });
+  const { data, refetch, error } = useQuery({ queryKey: ["dev-candidates"], queryFn: () => api("/admin/dev/candidates"), retry: false });
   const candidates = data?.candidates || [];
   const current = candidates.find((c) => c.user_id === selected);
   const run = async (action) => {
@@ -109,6 +109,16 @@ export function AdminDevPanel() {
       setBusy(null);
     }
   };
+  if (error) {
+    return (
+      <>
+        <PageHeader title="Developer Test Panel" />
+        <p className="rounded-xl bg-gray-50 p-4 text-sm text-gray-600" data-testid="dev-panel-disabled">
+          {error.message || "Developer tools are turned off on this server."} Set ENABLE_DEV_TOOLS=true on a test server to use them.
+        </p>
+      </>
+    );
+  }
   return (
     <>
       <PageHeader title="Developer Test Panel" />

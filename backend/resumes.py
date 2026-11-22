@@ -1,7 +1,8 @@
 """Candidate resume upload, background parsing, confirmation, deletion, and the Admin Candidate Talent Database.
 
-Resume files are encrypted with a per-file key before they reach object storage (see storage.py). Deleting a
-resume destroys its key, so the stored bytes can never be read again even though the storage API has no delete.
+Resume files are encrypted with a per-file key before they reach object storage (see storage.py). That key is
+stored wrapped with the RESUME_KEK master key, so the database alone cannot decrypt files. Deleting a resume
+destroys its key, so the stored bytes can never be read again even though the storage API has no delete.
 """
 import asyncio
 import base64
@@ -154,7 +155,7 @@ def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on
         return {k: s.get(k, v) for k, v in DEFAULT_SETTINGS.items()}
 
     def public(rec: dict) -> dict:
-        return {k: v for k, v in rec.items() if k not in ("enc_key", "storage_path", "lock_until", "_id")}
+        return {k: v for k, v in rec.items() if k not in ("enc_key", "enc_key_wrapped", "storage_path", "lock_until", "_id")}
 
     async def require_candidate(user=Depends(get_current_user)):
         if user.get("role") != "candidate":
@@ -162,9 +163,10 @@ def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on
         return user
 
     def require_perm(perm: str):
+        """Candidate data (resume files, exports) is deny-by-default: only the owner admin, or an admin whose
+        `permissions` list names this permission, gets through."""
         async def dep(admin=Depends(require_admin)):
-            # Admins created before permissions existed (no field) keep full access.
-            if "permissions" in admin and perm not in (admin.get("permissions") or []):
+            if not admin.get("is_owner") and perm not in (admin.get("permissions") or []):
                 raise HTTPException(403, "You don't have permission for this action")
             return admin
         return dep
@@ -194,7 +196,7 @@ def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on
     async def parse_one(rec: dict):
         try:
             blob = await asyncio.to_thread(storage._get_object, rec["storage_path"])
-            data = storage.decrypt(base64.b64decode(rec["enc_key"]), blob)
+            data = storage.decrypt(storage.unwrap_key(rec), blob)
             text = await asyncio.to_thread(file_to_text, f"x.{rec['file_type']}", data)
             fields = await asyncio.to_thread(extract, text)
             res = await db.candidate_resumes.update_one(
@@ -226,7 +228,7 @@ def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on
     @r.get("/resume")
     async def my_resumes(user=Depends(require_candidate)):
         recs = await db.candidate_resumes.find({"candidate_id": user["user_id"], "status": {"$ne": "deleted"}},
-                                               {"_id": 0, "enc_key": 0, "storage_path": 0, "lock_until": 0}
+                                               {"_id": 0, "enc_key": 0, "enc_key_wrapped": 0, "storage_path": 0, "lock_until": 0}
                                                ).sort("version", -1).to_list(20)
         s = await settings()
         return {"resumes": recs, "current": next((x for x in recs if x.get("is_current")), None),
@@ -246,10 +248,13 @@ def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on
         if len(data) > limit:
             raise HTTPException(400, f"File is too large. Please upload a file under {s['max_mb']:g} MB.")
         ftype = validate_file(file.filename or "", data)
+        if not storage.kek():
+            logger.error("resume upload refused: RESUME_KEK is not configured")
+            raise HTTPException(503, "Resume uploads are not available yet. Please try again later.")
         uid = user["user_id"]
         digest = hashlib.sha256(data).hexdigest()
         same = await db.candidate_resumes.find_one({"candidate_id": uid, "sha256": digest, "status": {"$ne": "deleted"}},
-                                                   {"_id": 0, "enc_key": 0, "storage_path": 0, "lock_until": 0})
+                                                   {"_id": 0, "enc_key": 0, "enc_key_wrapped": 0, "storage_path": 0, "lock_until": 0})
         if same:
             if not same.get("is_current"):
                 await db.candidate_resumes.update_many({"candidate_id": uid, "is_current": True}, {"$set": {"is_current": False}})
@@ -269,7 +274,7 @@ def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on
         rec = {"resume_id": rid, "candidate_id": uid, "version": ((last or {}).get("version") or 0) + 1, "is_current": True,
                "original_filename": re.sub(r"[^\w .()-]", "_", file.filename or f"resume.{ftype}")[:120],
                "file_type": ftype, "content_type": TYPES[ftype], "size": len(data), "sha256": digest,
-               "storage_path": path, "enc_key": base64.b64encode(key).decode(), "status": "queued", "attempts": 0,
+               "storage_path": path, "enc_key_wrapped": storage.wrap_key(key), "status": "queued", "attempts": 0,
                "lock_until": None, "error": None, "extracted": {}, "uploaded_at": now_iso(), "parsed_at": None,
                "confirmed_at": None, "deleted_at": None}
         await db.candidate_resumes.update_many({"candidate_id": uid, "is_current": True}, {"$set": {"is_current": False}})
@@ -285,11 +290,11 @@ def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on
         return rec
 
     async def file_response(rec: dict, download: bool) -> Response:
-        if not rec.get("enc_key"):
+        if not (rec.get("enc_key") or rec.get("enc_key_wrapped")):
             raise HTTPException(404, "Resume not found")
         try:
             blob = await asyncio.to_thread(storage._get_object, rec["storage_path"])
-            data = storage.decrypt(base64.b64decode(rec["enc_key"]), blob)
+            data = storage.decrypt(storage.unwrap_key(rec), blob)
         except Exception:
             raise HTTPException(502, "Could not load the resume file")
         disp = "attachment" if download else "inline"
@@ -333,7 +338,7 @@ def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on
             how = "key_destroyed_only"
         await db.candidate_resumes.update_one({"resume_id": rec["resume_id"]}, {
             "$set": {"status": "deleted", "is_current": False, "deleted_at": now_iso(), "extracted": {}, "storage_removal": how},
-            "$unset": {"enc_key": "", "sha256": ""}})
+            "$unset": {"enc_key": "", "enc_key_wrapped": "", "sha256": ""}})
         return how
 
     async def promote_latest(uid: str):
@@ -530,7 +535,7 @@ def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on
     async def talent_detail(cid: str, admin=Depends(require_admin)):
         u = await consented(cid)
         recs = await db.candidate_resumes.find({"candidate_id": cid, "status": {"$ne": "deleted"}},
-                                               {"_id": 0, "enc_key": 0, "storage_path": 0, "lock_until": 0, "sha256": 0}
+                                               {"_id": 0, "enc_key": 0, "enc_key_wrapped": 0, "storage_path": 0, "lock_until": 0, "sha256": 0}
                                                ).sort("version", -1).to_list(20)
         return {"candidate": {**u, **profile_status(u)}, "resumes": recs}
 
@@ -545,4 +550,21 @@ def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on
                         {"resume_id": rid, "version": rec.get("version")})
         return resp
 
-    return r, {"set_completion": set_completion, "permissions": PERMISSIONS}
+    async def wrap_legacy_keys() -> int:
+        """Startup migration: wrap plain per-file keys left by older builds once RESUME_KEK is configured."""
+        if not storage.kek():
+            if await db.candidate_resumes.count_documents({"enc_key": {"$exists": True}}, limit=1):
+                logger.error("SECURITY: resume keys are stored unwrapped; set RESUME_KEK so they get wrapped")
+            return 0
+        n = 0
+        async for rec in db.candidate_resumes.find({"enc_key": {"$exists": True}}, {"_id": 0, "resume_id": 1, "enc_key": 1}):
+            res = await db.candidate_resumes.update_one(
+                {"resume_id": rec["resume_id"], "enc_key": rec["enc_key"]},
+                {"$set": {"enc_key_wrapped": storage.wrap_key(base64.b64decode(rec["enc_key"]))},
+                 "$unset": {"enc_key": ""}})
+            n += res.modified_count
+        if n:
+            logger.info(f"Wrapped {n} legacy resume key(s) with RESUME_KEK")
+        return n
+
+    return r, {"set_completion": set_completion, "permissions": PERMISSIONS, "wrap_legacy_keys": wrap_legacy_keys}

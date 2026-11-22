@@ -13,8 +13,10 @@ import json
 import logging
 import os
 import uuid
+from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -22,13 +24,34 @@ from pydantic import BaseModel
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
+import ratelimit
+
 logger = logging.getLogger(__name__)
 API = "https://api.razorpay.com/v1"
 REOPENABLE = ["created", "failed", "cancelled"]
+STALE_ACTIVATION = timedelta(minutes=10)  # a "running" activation older than this is treated as crashed
+STALE_WEBHOOK = timedelta(minutes=5)
 
 
 def _keys():
     return (os.environ.get("RAZORPAY_KEY_ID") or "").strip(), (os.environ.get("RAZORPAY_KEY_SECRET") or "").strip()
+
+
+def api_base() -> str:
+    """Razorpay API base URL. RAZORPAY_API_BASE lets tests use a local stand-in, but it is honoured only with
+    test keys and a loopback host, so a misconfigured server can never send live keys anywhere else."""
+    override = (os.environ.get("RAZORPAY_API_BASE") or "").strip().rstrip("/")
+    if not override:
+        return API
+    host = (urlparse(override).hostname or "").lower()
+    if _keys()[0].startswith("rzp_test_") and host in ("localhost", "127.0.0.1", "::1"):
+        return override
+    logger.error("Ignoring RAZORPAY_API_BASE: only allowed with test keys and a localhost URL")
+    return API
+
+
+def _ago(delta: timedelta) -> str:
+    return (datetime.now(timezone.utc) - delta).isoformat()
 
 
 def payment_mode() -> dict:
@@ -75,9 +98,7 @@ def build_router(db, get_current_user, require_admin, checkout_plan, activate, s
             raise HTTPException(503, "Online payments are not configured yet. Please try again later.")
         try:
             async with httpx.AsyncClient(timeout=20) as c:
-                # RAZORPAY_API_BASE exists only so tests can point at a local stand-in; never set it in production.
-                base = (os.environ.get("RAZORPAY_API_BASE") or API).rstrip("/")
-                resp = await c.request(method, f"{base}{path}", auth=(key_id, secret), json=body)
+                resp = await c.request(method, f"{api_base()}{path}", auth=(key_id, secret), json=body)
         except httpx.HTTPError as e:
             logger.warning(f"razorpay {path}: {e}")
             raise HTTPException(502, "Could not reach the payment gateway. Please try again.")
@@ -106,11 +127,15 @@ def build_router(db, get_current_user, require_admin, checkout_plan, activate, s
                 "mismatch": _slim(payment), "updated_at": now_iso()}})
             logger.error(f"razorpay payment {payment.get('id')} does not match order {order_id}; not activated")
             raise HTTPException(400, "Payment details do not match this order. Our team has been alerted.")
+        # Claim the activation. A claim left "running" by a crashed request is taken over once it is stale;
+        # `activate` is idempotent per payment, so a takeover never adds the plan twice.
         claimed = await db.payments.find_one_and_update(
             {"order_id": order_id, "gateway": "razorpay", "subscription_id": None,
-             "activation": {"$nin": ["running", "done"]}},
-            {"$set": {"activation": "running", "status": "successful", "transaction_id": payment["id"],
-                      "payment_date": now_iso(), "verified_via": via, "gateway_response": _slim(payment),
+             "$or": [{"activation": {"$nin": ["running", "done"]}},
+                     {"activation": "running", "activation_started_at": {"$lt": _ago(STALE_ACTIVATION)}},
+                     {"activation": "running", "activation_started_at": {"$exists": False}}]},
+            {"$set": {"activation": "running", "activation_started_at": now_iso(), "status": "captured",
+                      "transaction_id": payment["id"], "verified_via": via, "gateway_response": _slim(payment),
                       "updated_at": now_iso()}},
             return_document=ReturnDocument.AFTER)
         if not claimed:  # another request is activating it, or already did
@@ -122,9 +147,10 @@ def build_router(db, get_current_user, require_admin, checkout_plan, activate, s
             logger.exception(f"activation failed for order {order_id}")
             raise HTTPException(500, "Your payment was received but activation failed. Our team will fix this.")
         receipt = await next_receipt_no()
+        # Only now, with the membership in place, is the payment shown as successful.
         await db.payments.update_one({"order_id": order_id}, {"$set": {
-            "activation": "done", "subscription_id": m["subscription_id"], "receipt_no": receipt,
-            "updated_at": now_iso()}})
+            "activation": "done", "status": "successful", "payment_date": now_iso(),
+            "subscription_id": m["subscription_id"], "receipt_no": receipt, "updated_at": now_iso()}})
         user = await db.users.find_one({"user_id": pay["candidate_id"]}, {"_id": 0, "email": 1, "full_name": 1})
         if user:
             inner = (f'<p style="color:#374151;font-size:15px">Hi {escape(user.get("full_name") or "there")},</p>'
@@ -157,6 +183,7 @@ def build_router(db, get_current_user, require_admin, checkout_plan, activate, s
     async def create_order(req: OrderReq, user=Depends(get_current_user)):
         if payment_mode()["gateway"] != "razorpay":
             raise HTTPException(503, "Online payments are not configured yet. Please try again later.")
+        ratelimit.check(f"rzp_order:user:{user['user_id']}", 10, 600)
         plan = await checkout_plan(user, req.plan_id)
         paise = int(round(float(plan["price"]) * 100))
         internal = f"pay_{uuid.uuid4().hex[:14]}"
@@ -225,9 +252,18 @@ def build_router(db, get_current_user, require_admin, checkout_plan, activate, s
         event_id = request.headers.get("x-razorpay-event-id") or hashlib.sha256(body).hexdigest()
         try:
             await db.payment_webhooks.insert_one({"event_id": event_id, "event": evt.get("event"),
-                                                  "received_at": now_iso(), "status": "processing"})
+                                                  "received_at": now_iso(), "started_at": now_iso(),
+                                                  "status": "processing"})
         except DuplicateKeyError:
-            return {"status": "duplicate"}
+            # A retry of an event that failed (or whose worker died mid-way) is processed again; an event that
+            # was handled successfully is acknowledged without doing anything.
+            retry = await db.payment_webhooks.find_one_and_update(
+                {"event_id": event_id, "$or": [
+                    {"status": {"$regex": "^error"}},
+                    {"status": "processing", "started_at": {"$lt": _ago(STALE_WEBHOOK)}}]},
+                {"$set": {"status": "processing", "started_at": now_iso()}, "$inc": {"attempts": 1}})
+            if not retry:
+                return {"status": "duplicate"}
         result = "ignored"
         try:
             payload = evt.get("payload") or {}
@@ -248,7 +284,13 @@ def build_router(db, get_current_user, require_admin, checkout_plan, activate, s
                 ref = (payload.get("refund") or {}).get("entity") or {}
                 result = await record_refund(ref)
         except HTTPException as e:
-            result = f"error: {e.detail}"
+            if e.status_code >= 500:
+                # Temporary failure (gateway or activation): answer non-2xx so Razorpay retries the event.
+                await db.payment_webhooks.update_one({"event_id": event_id},
+                                                     {"$set": {"status": f"error: {e.detail}"[:200]}})
+                raise HTTPException(500, "Webhook processing failed")
+            # Permanent problem (for example amount mismatch, already flagged on the payment): do not retry.
+            result = f"rejected: {e.detail}"
         except Exception as e:  # keep the event so it can be inspected; Razorpay retries non-2xx anyway
             logger.exception("razorpay webhook")
             await db.payment_webhooks.update_one({"event_id": event_id}, {"$set": {"status": f"error: {e}"[:200]}})
@@ -265,11 +307,36 @@ def build_router(db, get_current_user, require_admin, checkout_plan, activate, s
                         "at": now_iso()})
         done = sum(x["amount"] for x in refunds if x.get("status") in ("processed", "created", "pending"))
         status = pay["status"]
-        if pay["status"] in ("successful", "refunded", "partially_refunded"):
+        if pay["status"] in ("captured", "successful", "refunded", "partially_refunded"):
             status = "refunded" if done >= pay["amount"] else "partially_refunded" if done > 0 else "successful"
         await db.payments.update_one({"payment_id": pay["payment_id"]}, {"$set": {
             "refunds": refunds, "refunded_amount": done, "status": status, "updated_at": now_iso()}})
+        if status == "refunded" and pay.get("subscription_id"):
+            await revoke_refunded(pay)
+        elif status == "partially_refunded":
+            logger.warning(f"partial refund on {pay['payment_id']}: membership left unchanged, review manually")
         return f"refund {ref.get('status')}"
+
+    async def revoke_refunded(pay: dict) -> None:
+        """A fully refunded payment stops granting access. A renewal gives back only the days it added, so the
+        time the candidate paid for earlier is kept; any other purchase is cancelled. Runs once per payment."""
+        sub = await db.subscriptions.find_one_and_update(
+            {"subscription_id": pay["subscription_id"], "refund_revoked": {"$ne": True}},
+            {"$set": {"refund_revoked": True, "updated_at": now_iso()}})
+        if not sub:
+            return
+        days = int(sub.get("duration_days") or (pay.get("plan") or {}).get("duration_days") or 0)
+        end = sub.get("expiry_date")
+        if sub.get("is_renewal") and days and end:
+            new_end = (datetime.fromisoformat(end) - timedelta(days=days)).isoformat()
+            await db.subscriptions.update_one({"subscription_id": sub["subscription_id"]},
+                                              {"$set": {"expiry_date": new_end, "refunded_days": days}})
+            outcome = f"renewal reversed: expiry moved back {days} days"
+        else:
+            await db.subscriptions.update_one({"subscription_id": sub["subscription_id"]},
+                                              {"$set": {"status": "cancelled", "cancel_reason": "refunded"}})
+            outcome = "membership cancelled"
+        logger.info(f"refund on {pay['payment_id']}: {outcome}")
 
     # ------------------------------------------------------------------ admin
     @r.post("/admin/payments/{payment_id}/reconcile")
@@ -297,7 +364,7 @@ def build_router(db, get_current_user, require_admin, checkout_plan, activate, s
             {"$match": {"is_demo": {"$ne": True}}},
             {"$group": {"_id": "$status", "count": {"$sum": 1}, "amount": {"$sum": "$amount"},
                         "refunded": {"$sum": {"$ifNull": ["$refunded_amount", 0]}}}}]).to_list(20)
-        stuck = await db.payments.count_documents({"gateway": "razorpay", "status": "successful",
+        stuck = await db.payments.count_documents({"gateway": "razorpay", "status": {"$in": ["captured", "successful"]},
                                                    "subscription_id": None})
         return {"by_status": {x["_id"]: {"count": x["count"], "amount": x["amount"], "refunded": x["refunded"]}
                               for x in rows},
