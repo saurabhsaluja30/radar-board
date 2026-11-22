@@ -6,21 +6,18 @@ import uuid
 import pytest
 import requests
 from pymongo import MongoClient
+from envutil import env_value  # noqa: E402
 
 BASE_URL = os.environ.get("REACT_APP_BACKEND_URL").rstrip("/")
 API = f"{BASE_URL}/api"
-ADMIN = {"email": "admin@eevolvex.com", "password": "Admin@12345"}
+ADMIN = {"email": os.environ.get("ADMIN_EMAIL", "admin@eevolvex.com"), "password": os.environ.get("ADMIN_PASSWORD", "Admin@12345")}
 CAND = {"email": "test@jobradar.com", "password": "Test@12345"}
 N = int(os.environ.get("PACE_N", "12"))
 
 
-def _env(path, key):
-    for line in open(path):
-        if line.startswith(key + "="):
-            return line.split("=", 1)[1].strip().strip('"')
 
 
-MONGO = MongoClient(_env("/app/backend/.env", "MONGO_URL"))[_env("/app/backend/.env", "DB_NAME")]
+MONGO = MongoClient(env_value("MONGO_URL"))[env_value("DB_NAME")]
 UID = uuid.uuid4().hex[:6]
 SUBJECT = f"TEST_Announcement {UID}"
 STATE = {"users": [], "emails": [], "inserted_log_ids": [], "suspended_real": []}
@@ -53,8 +50,8 @@ def cands():
     for i in range(N):
         email = f"test_pace_{i}_{UID}@example.com"
         r = requests.post(f"{API}/auth/register", json={
-            "full_name": f"TEST_PACE {i}", "email": email, "mobile": "9876543210", "password": "Test@123",
-            "confirm_password": "Test@123", "industry": "IT & Technology", "current_designation": "Engineer",
+            "full_name": f"TEST_PACE {i}", "email": email, "mobile": "9876543210", "password": "Test@1234",
+            "confirm_password": "Test@1234", "industry": "IT & Technology", "current_designation": "Engineer",
             "current_salary": "10 LPA", "preferred_location": "Bengaluru", "preferred_work_mode": "Remote",
             "consent": True}, timeout=90)
         assert r.status_code == 200, r.text

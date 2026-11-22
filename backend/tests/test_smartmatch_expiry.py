@@ -4,15 +4,14 @@ from datetime import date, timedelta
 
 import requests
 from pymongo import MongoClient
+from envutil import env_value  # noqa: E402
 
 BASE_URL = os.environ.get("REACT_APP_BACKEND_URL").rstrip("/")
 API = f"{BASE_URL}/api"
 
 
 def _env(key):
-    for line in open("/app/backend/.env"):
-        if line.startswith(key + "="):
-            return line.split("=", 1)[1].strip().strip('"')
+    return env_value(key)
 
 
 DB = MongoClient(_env("MONGO_URL"))[_env("DB_NAME")]
@@ -20,7 +19,7 @@ DB = MongoClient(_env("MONGO_URL"))[_env("DB_NAME")]
 
 class TestExpiry:
     def test_expired_job_detail_hidden(self):
-        tok = requests.post(f"{API}/auth/admin/login", json={"email": "admin@eevolvex.com", "password": "Admin@12345"}).json()["token"]
+        tok = requests.post(f"{API}/auth/admin/login", json={"email": os.environ.get("ADMIN_EMAIL", "admin@eevolvex.com"), "password": os.environ.get("ADMIN_PASSWORD", "Admin@12345")}).json()["token"]
         h = {"Authorization": f"Bearer {tok}"}
         past = (date.today() - timedelta(days=3)).isoformat()
         r = requests.post(f"{API}/admin/jobs", headers=h, json={

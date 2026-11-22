@@ -13,7 +13,7 @@ from ops import SCHEDULES, recommend  # noqa: E402
 
 BASE_URL = (os.environ.get("REACT_APP_BACKEND_URL") or "").rstrip("/")
 API = f"{BASE_URL}/api"
-ADMIN = {"email": "admin@eevolvex.com", "password": "Admin@12345"}
+ADMIN = {"email": os.environ.get("ADMIN_EMAIL", "admin@eevolvex.com"), "password": os.environ.get("ADMIN_PASSWORD", "Admin@12345")}
 
 
 # --------------------------------------------------------------------------- unit

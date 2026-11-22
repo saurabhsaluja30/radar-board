@@ -13,7 +13,7 @@ from pymongo import MongoClient
 
 BASE_URL = os.environ.get("REACT_APP_BACKEND_URL").rstrip("/")
 API = f"{BASE_URL}/api"
-ADMIN = {"email": "admin@eevolvex.com", "password": "Admin@12345"}
+ADMIN = {"email": os.environ.get("ADMIN_EMAIL", "admin@eevolvex.com"), "password": os.environ.get("ADMIN_PASSWORD", "Admin@12345")}
 
 
 def _env(key):
@@ -132,14 +132,15 @@ class TestResumes:
         r = upload(h, first)
         assert r.status_code == 200, r.text
         rid = r.json()["resume"]["resume_id"]
-        assert "enc_key" not in r.json()["resume"]
+        assert "enc_key" not in r.json()["resume"] and "enc_key_wrapped" not in r.json()["resume"]
         rec = wait_parsed(h, rid)
         assert rec["status"] == "parsed", rec
         ex = rec["extracted"]
         assert ex["current_company"] == "Horizon Trips" and "sabre" in ex["tools"]
         # Stored bytes are encrypted, not the original document.
         raw = DB.candidate_resumes.find_one({"resume_id": rid})
-        assert raw["enc_key"] and raw["status"] == "parsed"
+        # The file key is stored wrapped with RESUME_KEK, never in plain form.
+        assert raw["enc_key_wrapped"] and "enc_key" not in raw and raw["status"] == "parsed"
 
         # Same file again: nothing new stored.
         dup = upload(h, first)
@@ -195,7 +196,7 @@ class TestResumes:
         # Delete: key destroyed, file unreachable, previous version becomes current.
         assert requests.delete(f"{API}/resume/{rid2}", headers=h).status_code == 200
         gone = DB.candidate_resumes.find_one({"resume_id": rid2})
-        assert gone["status"] == "deleted" and "enc_key" not in gone
+        assert gone["status"] == "deleted" and "enc_key" not in gone and "enc_key_wrapped" not in gone
         assert requests.get(f"{API}/resume/{rid2}/file", headers=h).status_code == 404
         assert requests.get(f"{API}/admin/talent/{uid}/resume/{rid2}", headers=self.adm).status_code == 404
         assert requests.get(f"{API}/resume", headers=h).json()["current"]["resume_id"] == rid

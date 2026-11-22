@@ -6,14 +6,14 @@ import requests
 
 BASE_URL = os.environ.get("REACT_APP_BACKEND_URL").rstrip("/")
 API = f"{BASE_URL}/api"
-ADMIN = {"email": "admin@eevolvex.com", "password": "Admin@12345"}
+ADMIN = {"email": os.environ.get("ADMIN_EMAIL", "admin@eevolvex.com"), "password": os.environ.get("ADMIN_PASSWORD", "Admin@12345")}
 
 
 def _reg_payload():
     uid = uuid.uuid4().hex[:8]
     return {
         "full_name": f"TEST_User {uid}", "email": f"test_{uid}@example.com", "mobile": "9876543210",
-        "password": "Test@123", "confirm_password": "Test@123", "industry": "Banking & Financial Services",
+        "password": "Test@1234", "confirm_password": "Test@1234", "industry": "Banking & Financial Services",
         "current_designation": "Analyst", "current_salary": "8 LPA", "preferred_location": "Bengaluru",
         "preferred_work_mode": "Remote", "consent": True, "preferred_industries": [],
     }

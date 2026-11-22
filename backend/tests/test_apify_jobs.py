@@ -25,7 +25,7 @@ BACKEND = os.environ.get("APIFY_TEST_BACKEND_URL")
 
 def _today():
     return datetime.now(timezone.utc).date()  # the server uses UTC dates
-ADMIN = {"email": "admin@eevolvex.com", "password": "Admin@12345"}
+ADMIN = {"email": os.environ.get("ADMIN_EMAIL", "admin@eevolvex.com"), "password": os.environ.get("ADMIN_PASSWORD", "Admin@12345")}
 LONG = "We are hiring a travel consultant to handle ticketing on Sabre and Amadeus. " * 5 + "Requires 2-5 years experience."
 
 

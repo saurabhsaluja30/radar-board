@@ -13,7 +13,7 @@ from tracker import STAGES, STATUSES  # noqa: E402
 
 BASE_URL = (os.environ.get("REACT_APP_BACKEND_URL") or "").rstrip("/")
 API = f"{BASE_URL}/api"
-ADMIN = {"email": "admin@eevolvex.com", "password": "Admin@12345"}
+ADMIN = {"email": os.environ.get("ADMIN_EMAIL", "admin@eevolvex.com"), "password": os.environ.get("ADMIN_PASSWORD", "Admin@12345")}
 TAG = uuid.uuid4().hex[:6]
 PROFILE = {"current_designation": "Accountant", "tools": ["Tally", "GST"], "primary_skills": ["Reconciliation"],
            "total_experience": 4, "preferred_industries": ["Finance & Accounting"], "preferred_locations": ["Pune"],

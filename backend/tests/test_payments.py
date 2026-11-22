@@ -104,7 +104,8 @@ def stack():
     fake = ThreadingHTTPServer(("127.0.0.1", FAKE_PORT), FakeRazorpay)
     threading.Thread(target=fake.serve_forever, daemon=True).start()
     env = {**os.environ, "RAZORPAY_KEY_ID": KEY_ID, "RAZORPAY_KEY_SECRET": KEY_SECRET,
-           "RAZORPAY_WEBHOOK_SECRET": HOOK_SECRET, "RAZORPAY_API_BASE": f"http://127.0.0.1:{FAKE_PORT}/v1"}
+           "RAZORPAY_WEBHOOK_SECRET": HOOK_SECRET, "RAZORPAY_API_BASE": f"http://127.0.0.1:{FAKE_PORT}/v1",
+           "RATE_LIMITS": "off"}  # the suite registers many candidates from one IP
     proc = subprocess.Popen([sys.executable, "-m", "uvicorn", "server:app", "--port", str(PORT)], cwd=HERE, env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     db = MongoClient(_env("MONGO_URL"))[_env("DB_NAME")]
@@ -331,12 +332,53 @@ class TestMembershipsAndPayments:
         assert webhook("refund.processed", {"refund": {"entity": ref}}).status_code == 200
         p = stack.payments.find_one({"order_id": o["order_id"]})
         assert p["status"] == "refunded" and p["refunded_amount"] == 599
+        assert not membership(h)["is_active"], "a fully refunded purchase no longer grants access"
+        # Replaying the refund event is harmless.
+        assert webhook("refund.processed", {"refund": {"entity": ref}}).status_code == 200
+
+    def test_refunding_a_renewal_keeps_the_earlier_paid_days(self, stack):
+        h, uid = candidate(stack)
+        monthly = plans_by_tier()[0]["monthly"]["plan_id"]
+        pay(h, order(h, monthly)["order_id"])
+        o2 = order(h, monthly)
+        _, pid2 = pay(h, o2["order_id"])
+        assert 59 <= days_left(membership(h)) <= 60
+        ref = {"id": f"rfnd_{uuid.uuid4().hex[:10]}", "payment_id": pid2, "amount": 59900, "status": "processed"}
+        assert webhook("refund.processed", {"refund": {"entity": ref}}).status_code == 200
+        m = membership(h)
+        assert m["is_active"] and 29 <= days_left(m) <= 30, "only the refunded renewal's 30 days are removed"
+
+    def test_failed_webhook_is_processed_again_on_retry(self, stack):
+        h, uid = candidate(stack)
+        o = order(h, plans_by_tier()[0]["monthly"]["plan_id"])
+        pid = fake_payment(o["order_id"])
+        evt = f"test_evt_{uuid.uuid4().hex[:10]}"
+        # Simulate an earlier delivery of this event that crashed mid-way.
+        stack.payment_webhooks.insert_one({"event_id": evt, "event": "payment.captured", "status": "error: boom",
+                                           "received_at": datetime.now(timezone.utc).isoformat()})
+        r = webhook("payment.captured", {"payment": {"entity": PAYMENTS[pid]}}, event_id=evt)
+        assert r.status_code == 200 and r.json()["status"] == "fulfilled", r.text
+        assert membership(h)["is_active"]
+        assert webhook("payment.captured", {"payment": {"entity": PAYMENTS[pid]}}, event_id=evt).json()["status"] == "duplicate"
+
+    def test_stuck_activation_is_recovered(self, stack):
+        h, uid = candidate(stack)
+        o = order(h, plans_by_tier()[0]["monthly"]["plan_id"])
+        pid = fake_payment(o["order_id"])
+        # A request crashed after claiming the activation long ago.
+        stack.payments.update_one({"order_id": o["order_id"]}, {"$set": {
+            "activation": "running", "activation_started_at": "2000-01-01T00:00:00+00:00", "status": "captured"}})
+        r = webhook("payment.captured", {"payment": {"entity": PAYMENTS[pid]}})
+        assert r.json()["status"] == "fulfilled", r.text
+        p = stack.payments.find_one({"order_id": o["order_id"]})
+        assert p["activation"] == "done" and p["status"] == "successful" and p["subscription_id"]
+        assert stack.subscriptions.count_documents({"payment_id": p["payment_id"]}) == 1
 
     def test_admin_reconcile_activates_a_missed_payment(self, stack):
         h, uid = candidate(stack)
         o = order(h, plans_by_tier()[0]["monthly"]["plan_id"])
         fake_payment(o["order_id"])  # paid, but neither verify nor webhook arrived
-        admin = requests.post(f"{API}/auth/admin/login", json={"email": "admin@eevolvex.com", "password": "Admin@12345"})
+        admin = requests.post(f"{API}/auth/admin/login", json={"email": os.environ.get("ADMIN_EMAIL", "admin@eevolvex.com"), "password": os.environ.get("ADMIN_PASSWORD", "Admin@12345")})
         ah = {"Authorization": "Bearer " + admin.json()["token"]}
         summary = requests.get(f"{API}/admin/payments/summary", headers=ah).json()
         assert summary["mode"]["gateway"] == "razorpay" and summary["webhook_configured"] is True

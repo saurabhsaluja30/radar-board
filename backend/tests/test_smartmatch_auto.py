@@ -14,7 +14,7 @@ from smartmatch import WEIGHTS, score_match  # noqa: E402
 
 BASE_URL = (os.environ.get("REACT_APP_BACKEND_URL") or "").rstrip("/")
 API = f"{BASE_URL}/api"
-ADMIN = {"email": "admin@eevolvex.com", "password": "Admin@12345"}
+ADMIN = {"email": os.environ.get("ADMIN_EMAIL", "admin@eevolvex.com"), "password": os.environ.get("ADMIN_PASSWORD", "Admin@12345")}
 
 JOB = {"title": "Ticketing Executive", "required_skills": "Sabre, Amadeus", "experience_min": 3, "experience_max": 6,
        "industry_category": "Travel & Hospitality", "location": "Mumbai, India", "city": "Mumbai", "work_mode": "Hybrid",

@@ -6,21 +6,18 @@ from datetime import datetime, timedelta, timezone
 import pytest
 import requests
 from pymongo import MongoClient
+from envutil import env_value  # noqa: E402
 
 BASE_URL = os.environ.get("REACT_APP_BACKEND_URL").rstrip("/")
 API = f"{BASE_URL}/api"
-ADMIN = {"email": "admin@eevolvex.com", "password": "Admin@12345"}
+ADMIN = {"email": os.environ.get("ADMIN_EMAIL", "admin@eevolvex.com"), "password": os.environ.get("ADMIN_PASSWORD", "Admin@12345")}
 
 
-def _env(path, key):
-    for line in open(path):
-        if line.startswith(key + "="):
-            return line.split("=", 1)[1].strip().strip('"')
 
 
-CRON_SECRET = _env("/app/backend/.env", "WEBHOOK_CRON_SECRET")
-MONGO_URL = _env("/app/backend/.env", "MONGO_URL")
-DB_NAME = _env("/app/backend/.env", "DB_NAME")
+CRON_SECRET = env_value("WEBHOOK_CRON_SECRET")
+MONGO_URL = env_value("MONGO_URL")
+DB_NAME = env_value("DB_NAME")
 PDF = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF"
 
 
@@ -44,7 +41,7 @@ def cand():
     uid = uuid.uuid4().hex[:8]
     r = requests.post(f"{API}/auth/register", json={
         "full_name": f"TEST_Tracker {uid}", "email": f"test_trk_{uid}@example.com", "mobile": "9876543210",
-        "password": "Test@123", "confirm_password": "Test@123", "industry": "IT & Technology",
+        "password": "Test@1234", "confirm_password": "Test@1234", "industry": "IT & Technology",
         "current_designation": "Engineer", "current_salary": "8 LPA", "preferred_location": "Dubai",
         "preferred_work_mode": "Remote", "consent": True, "preferred_industries": ["IT & Technology", "HR & Recruitment"],
     })
