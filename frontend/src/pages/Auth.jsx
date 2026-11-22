@@ -105,7 +105,7 @@ export function Register() {
       return notify("Complete Industry, Designation, Salary, Preferred Location & Work Mode", "error");
     if (form.password !== form.confirm_password) return notify("Passwords do not match", "error");
     if (!consent) return notify("Please accept the Terms & Privacy Policy", "error");
-    if (resume && !/\.(pdf|docx)$/i.test(resume.name)) return notify("Resume must be a PDF or Word (.docx) file", "error");
+    if (resume && !/\.(pdf|docx?)$/i.test(resume.name)) return notify("Resume must be a PDF or Word (.doc or .docx) file", "error");
     if (resume && resumeCfg && resume.size > resumeCfg.max_mb * 1024 * 1024) return notify(`Resume must be under ${resumeCfg.max_mb} MB`, "error");
     setLoading(true);
     try {
@@ -175,8 +175,8 @@ export function Register() {
         {resumeCfg?.uploads_enabled ? (
           <label className="block" data-testid="reg-resume">
             <span className="label">Resume (optional)</span>
-            <input type="file" accept=".pdf,.docx" className="field mt-1.5" onChange={(e) => setResume(e.target.files?.[0] || null)} data-testid="reg-resume-input" />
-            <span className="mt-1 block text-xs text-gray-500">PDF or Word (.docx), up to {resumeCfg.max_mb} MB. We'll read it and let you review the details before anything is saved.</span>
+            <input type="file" accept=".pdf,.doc,.docx" className="field mt-1.5" onChange={(e) => setResume(e.target.files?.[0] || null)} data-testid="reg-resume-input" />
+            <span className="mt-1 block text-xs text-gray-500">PDF or Word (.doc or .docx), up to {resumeCfg.max_mb} MB. We'll read it and let you review the details before anything is saved.</span>
           </label>
         ) : null}
         <div className="flex items-start gap-3 text-sm text-gray-600">

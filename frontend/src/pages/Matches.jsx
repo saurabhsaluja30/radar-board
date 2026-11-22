@@ -8,10 +8,72 @@ import { formatDate, scoreColor } from "@/lib/constants";
 import { Badge, Button, Card, Chip, EmptyState, errMsg, notify, PageHeader, Spinner } from "@/components/kit";
 import { Page } from "@/components/Layout";
 import { ALERT_NOTICE, ProfileCompletion } from "@/components/SmartProfile";
+import { areaCls } from "@/components/career";
+import { TRACK_STATUSES } from "@/pages/Tracker";
+
+const STAGE_LABEL = Object.fromEntries(TRACK_STATUSES.map(([k, l]) => [k, l]));
+const VERDICT_COLOR = { Suitable: "success", "Partially Suitable": "warning", "Not Currently Suitable": "error" };
+
+// Candidate's own JD check. Uses the same SmartMatch rules as their job matches, against their confirmed profile.
+function JdCheck() {
+  const navigate = useNavigate();
+  const [jd, setJd] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [res, setRes] = useState(null);
+  const { data: saved } = useQuery({ queryKey: ["saved-jobs"], queryFn: () => api("/saved-jobs") });
+  const run = async (body) => {
+    setBusy(true);
+    try {
+      setRes(await api("/smartmatch/jd-check", { method: "POST", body }));
+    } catch (e) {
+      notify(errMsg(e), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const list = (label, items, cls) => (items?.length ? <p className={`text-sm ${cls}`}><b>{label}:</b> {items.join(", ")}</p> : null);
+  return (
+    <div className="grid gap-6 lg:grid-cols-2" data-testid="jd-check">
+      <Card className="space-y-3">
+        <p className="font-extrabold">Check how well a job fits your profile</p>
+        <p className="text-sm text-gray-500">Paste any job description, or pick a saved job. JobRadar compares it with your confirmed profile using the same rules as your matches. It's free and doesn't use your AI tool limits.</p>
+        {saved?.jobs?.length ? (
+          <select className="field" defaultValue="" onChange={(e) => e.target.value && run({ job_id: e.target.value })} data-testid="jd-check-job">
+            <option value="">Check one of my saved jobs…</option>
+            {saved.jobs.map((j) => <option key={j.job_id} value={j.job_id}>{j.title} · {j.company}</option>)}
+          </select>
+        ) : null}
+        <textarea value={jd} onChange={(e) => setJd(e.target.value)} maxLength={12000} className={`${areaCls} min-h-[220px]`} placeholder="Paste the complete job description" data-testid="jd-check-text" />
+        <Button title="Check My Fit" loading={busy} onClick={() => run({ jd_text: jd })} data-testid="jd-check-run" />
+      </Card>
+      {res ? (
+        <Card className="space-y-4" data-testid="jd-check-result">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <Badge label={res.verdict} color={VERDICT_COLOR[res.verdict]} />
+              <p className="mt-2 text-sm text-gray-600">{res.summary}</p>
+            </div>
+            <div className="text-right"><p className="text-3xl font-extrabold text-brand" data-testid="jd-check-score">{res.score}</p><p className="text-xs text-gray-500">out of 100</p></div>
+          </div>
+          <p className="text-xs text-gray-500">Based on {res.assessed_factors} of {res.total_factors} factors. {res.not_assessed?.length ? `Not assessed: ${res.not_assessed.join(", ")}.` : ""}</p>
+          {list("Matched skills", res.matched_skills, "text-emerald-700")}
+          {res.missing_mandatory_skills?.length ? (
+            <p className="flex items-start gap-1.5 rounded-lg bg-red-50 p-2 text-sm text-red-700"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />Missing required skills: {res.missing_mandatory_skills.join(", ")}</p>
+          ) : null}
+          {list("Nice-to-have skills you don't show", res.missing_preferred_skills, "text-amber-700")}
+          {list("Experience", res.experience_gaps, "text-gray-700")}
+          <div><p className="text-sm font-bold">What to do next</p><ul className="mt-1 list-disc space-y-1 pl-5 text-sm text-gray-700">{res.recommendations.map((r) => <li key={r}>{r}</li>)}</ul></div>
+          {res.profile?.missing?.length ? <Button size="sm" variant="outline" title="Complete my profile" onClick={() => navigate("/profile")} data-testid="jd-check-profile" /> : null}
+          <p className="text-[11px] text-gray-400">{res.disclaimer} Only skills JobRadar recognises are compared, so read the job description yourself too.</p>
+        </Card>
+      ) : null}
+    </div>
+  );
+}
 
 const expText = (j) => (j.experience_min != null && j.experience_max != null ? `${j.experience_min}–${j.experience_max} yrs` : j.experience_required || "Experience not specified");
 
-function MatchCard({ j, refresh }) {
+export function MatchCard({ j, refresh }) {
   const navigate = useNavigate();
   const [busy, setBusy] = useState(null);
   const m = j.match;
@@ -66,7 +128,7 @@ function MatchCard({ j, refresh }) {
         <p className="flex items-start gap-1.5 rounded-lg bg-red-50 p-2 text-xs text-red-700" data-testid={`match-gaps-${j.job_id}`}><AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />Mandatory skill gaps: {m.missing_mandatory_skills.join(", ")}</p>
       ) : null}
       {m.provisional ? <p className="text-[11px] text-amber-700">Provisional match — not enough information about: {m.missing_data.join(", ")}</p> : null}
-      {j.tracked_status ? <Badge label={`In your tracker: ${j.tracked_status.replace("_", " ")}`} color="brand" /> : null}
+      {j.tracked_status ? <Badge label={`In your tracker: ${STAGE_LABEL[j.tracked_status] || j.tracked_status}`} color="brand" /> : null}
       <div className="mt-auto flex flex-wrap gap-2 pt-1">
         <Button size="sm" title="View Details" onClick={() => navigate(`/job/${j.job_id}`)} data-testid={`mc-view-${j.job_id}`} />
         <Button size="sm" variant="outline" title={j.is_saved ? "Saved" : "Save Job"} icon={<Bookmark className="h-3.5 w-3.5" />} loading={busy === "save"} onClick={save} data-testid={`mc-save-${j.job_id}`} />
@@ -81,7 +143,7 @@ function MatchCard({ j, refresh }) {
 }
 
 const TABS = [["shared", "Job Alerts"], ["recommended", "Recommended Jobs"], ["strong", "Strong Matches"], ["recent", "Recently Added"],
-  ["saved", "Saved Jobs"], ["viewed", "Previously Viewed"]];
+  ["saved", "Saved Jobs"], ["viewed", "Previously Viewed"], ["check", "Check a Job Description"]];
 
 export default function Matches() {
   const navigate = useNavigate();
@@ -100,7 +162,7 @@ export default function Matches() {
           <div className="mb-6 grid gap-4 lg:grid-cols-[1fr_360px]">
             <div className="flex flex-wrap content-start gap-2" data-testid="matches-tabs">
               {TABS.map(([k, l]) => (
-                <Chip key={k} label={`${l} (${(data[k] || []).length})${k === "shared" && data.unread ? ` · ${data.unread} new` : ""}`} selected={tab === k} onClick={() => setTab(k)} data-testid={`matches-tab-${k}`} />
+                <Chip key={k} label={k === "check" ? l : `${l} (${(data[k] || []).length})${k === "shared" && data.unread ? ` · ${data.unread} new` : ""}`} selected={tab === k} onClick={() => setTab(k)} data-testid={`matches-tab-${k}`} />
               ))}
               <p className="w-full text-xs text-gray-500" data-testid="matches-alert-notice">
                 {data.alerts.pref === "opted_out" ? "You turned off job alerts, so JobRadar won't send you opportunities. Your matches below are still based on your profile. " : `${ALERT_NOTICE} `}
@@ -109,7 +171,7 @@ export default function Matches() {
             </div>
             <ProfileCompletion compact />
           </div>
-          {list.length === 0 ? (
+          {tab === "check" ? <JdCheck /> : list.length === 0 ? (
             <EmptyState title="Nothing here yet" subtitle={tab === "shared" ? "When a new job strongly matches your profile, JobRadar alerts you here." : "Complete your profile to improve your matches."} data-testid="matches-empty" />
           ) : (
             <div className="grid gap-4 lg:grid-cols-2" data-testid={`matches-list-${tab}`}>

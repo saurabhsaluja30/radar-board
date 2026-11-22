@@ -129,7 +129,7 @@ export function ResumeCard() {
 
   const pick = async (file) => {
     if (!file) return;
-    if (!/\.(pdf|docx)$/i.test(file.name)) return notify("Please choose a PDF or Word (.docx) file", "error");
+    if (!/\.(pdf|docx?)$/i.test(file.name)) return notify("Please choose a PDF or Word (.doc or .docx) file", "error");
     if (file.size > data.max_mb * 1024 * 1024) return notify(`File must be under ${data.max_mb} MB`, "error");
     setBusy(true);
     try {
@@ -174,11 +174,11 @@ export function ResumeCard() {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <p className="h-sec">My resume</p>
-          <p className="muted">PDF or Word (.docx), up to {data.max_mb} MB. We read it to fill in your profile — you review everything first.</p>
+          <p className="muted">PDF or Word (.doc or .docx), up to {data.max_mb} MB. We read it to fill in your profile — you review everything first.</p>
         </div>
         {data.uploads_enabled ? (
           <>
-            <input ref={input} type="file" accept=".pdf,.docx" className="hidden" onChange={(e) => pick(e.target.files?.[0])} data-testid="resume-input" />
+            <input ref={input} type="file" accept=".pdf,.doc,.docx" className="hidden" onChange={(e) => pick(e.target.files?.[0])} data-testid="resume-input" />
             <Button title={cur ? "Replace resume" : "Upload resume"} icon={<Upload className="h-4 w-4" />} loading={busy}
               onClick={() => input.current?.click()} data-testid="resume-upload" />
           </>

@@ -3,8 +3,8 @@ import { useNavigate, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { AlertCircle, ArrowDown, ArrowUp, Plus, Trash2, X } from "lucide-react";
 import { api } from "@/lib/api";
-import { NEW_ROLE_BLOCK, STYLES } from "@/lib/resumeTemplates";
-import { Button, Card, Chip, errMsg, Input, Modal, notify, Spinner } from "@/components/kit";
+import { NEW_ROLE_BLOCK, STYLE_LOOK, STYLES } from "@/lib/resumeTemplates";
+import { Badge, Button, Card, Chip, errMsg, Input, Modal, notify, Spinner } from "@/components/kit";
 import { areaCls, BulletList, downloadResume, UsagePill, useCareerUsage, useInvalidateUsage } from "@/components/career";
 import { Page } from "@/components/Layout";
 
@@ -14,18 +14,19 @@ const PERSONAL = [
 ];
 
 export function ResumePaper({ personal, sections, template }) {
-  const serif = template === "compact" ? { fontFamily: "Georgia, serif" } : undefined;
-  const accent = template === "modern" ? "#1F3A5F" : "#111111";
+  const look = STYLE_LOOK[template] || STYLE_LOOK.classic;
+  const serif = look.font ? { fontFamily: look.font } : undefined;
+  const accent = look.accent;
   const contact = [personal.email, personal.phone, personal.location,
     personal.preferred_location ? `Preferred location: ${personal.preferred_location}` : "", personal.linkedin].filter(Boolean);
   const visible = sections.filter((s) => s.content?.trim());
   return (
     <div className="rounded-md border border-gray-300 bg-white p-8 shadow-sm" style={serif} data-testid="re-paper">
-      <p className="text-2xl font-extrabold" style={{ color: accent }}>{personal.full_name || "Your Name"}</p>
+      <p className={`${look.name} font-extrabold`} style={{ color: accent }}>{personal.full_name || "Your Name"}</p>
       {contact.length ? <p className="mt-1 text-xs text-gray-600">{contact.join(" | ")}</p> : null}
       {visible.map((s, i) => (
         <div key={s.id || i} className="mt-5">
-          <p className="mb-1 border-b border-gray-400 pb-0.5 text-xs font-extrabold tracking-wider" style={{ color: accent }}>{s.title.toUpperCase()}</p>
+          <p className={`mb-1 pb-0.5 text-xs font-extrabold tracking-wider ${look.rule ? "border-b border-gray-400" : ""}`} style={{ color: accent }}>{s.title.toUpperCase()}</p>
           {s.content.split("\n").filter((l) => l.trim()).map((l, j) => {
             const b = /^\s*[-•*]\s/.test(l);
             return <p key={j} className={`text-[13px] leading-relaxed text-gray-800 ${b ? "pl-3" : ""}`}>{b ? "• " + l.replace(/^\s*[-•*]\s/, "") : l}</p>;
@@ -53,6 +54,98 @@ function SectionEditor({ s, i, onChange, onMove, onRemove }) {
   );
 }
 
+function LineDiff({ text, other, tone }) {
+  const others = new Set((other || "").split("\n").map((l) => l.trim()).filter(Boolean));
+  const lines = (text || "").split("\n").filter((l) => l.trim());
+  if (!lines.length) return <p className="text-sm italic text-gray-400">(empty)</p>;
+  return lines.map((l, i) => {
+    const changed = !others.has(l.trim());
+    const cls = changed ? (tone === "after" ? "bg-emerald-50 text-emerald-900" : "bg-red-50 text-red-800 line-through decoration-red-300") : "text-gray-700";
+    return <p key={i} className={`rounded px-1 text-[13px] leading-relaxed ${cls}`}>{l}</p>;
+  });
+}
+
+// Before/after review of a tailoring proposal. Nothing is saved until the candidate keeps at least one change.
+function TailorReview({ draft, onCancel, onSaved }) {
+  const reviewable = draft.sections.filter((r) => r.status !== "unchanged");
+  // Reworded sections start as kept; sections the AI added start as left out, so nothing new slips in unread.
+  const [keep, setKeep] = useState(() => Object.fromEntries(reviewable.map((r) => [r.key, r.status !== "new"])));
+  const [edits, setEdits] = useState({});
+  const [editing, setEditing] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const accepted = Object.keys(keep).filter((k) => keep[k]);
+  const save = async () => {
+    setSaving(true);
+    try {
+      const res = await api(`/career/tailor-drafts/${draft.draft_id}/apply`, { method: "POST", body: { accepted, edits } });
+      onSaved(res.resume);
+    } catch (e) {
+      notify(errMsg(e), "error");
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <Page>
+      <div className="mb-6">
+        <button onClick={onCancel} className="text-sm font-bold text-brand hover:underline" data-testid="tr-back">‹ Back to my resume (nothing saved)</button>
+        <h1 className="h-page mt-2">Review suggested changes</h1>
+        <p className="muted mt-1">For: {draft.jd_title}. Keep only changes that are true to your background. Your original resume stays unchanged; what you keep is saved as a new version.</p>
+      </div>
+      <div className="grid gap-6 xl:grid-cols-[1fr_320px]">
+        <div className="space-y-4">
+          {reviewable.length === 0 ? <Card><p className="muted">No changes were suggested. Your resume already fits this job description well.</p></Card> : null}
+          {reviewable.map((r) => (
+            <Card key={r.key} className={`space-y-3 ${keep[r.key] ? "border-brand" : ""}`} data-testid={`tr-section-${r.key}`}>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="font-extrabold tracking-wide">{r.title.toUpperCase()} {r.status === "new" ? <Badge label="New section" color="warning" /> : null}</p>
+                <div className="flex gap-2">
+                  <Chip label="Keep change" selected={!!keep[r.key]} onClick={() => setKeep((k) => ({ ...k, [r.key]: true }))} data-testid={`tr-keep-${r.key}`} />
+                  <Chip label={r.status === "new" ? "Leave out" : "Keep original"} selected={!keep[r.key]} onClick={() => setKeep((k) => ({ ...k, [r.key]: false }))} data-testid={`tr-reject-${r.key}`} />
+                </div>
+              </div>
+              <div className="grid gap-3 md:grid-cols-2">
+                <div><p className="mb-1 text-xs font-bold uppercase text-gray-400">Before</p><LineDiff text={r.before} other={r.after} tone="before" /></div>
+                <div>
+                  <div className="mb-1 flex items-center justify-between">
+                    <p className="text-xs font-bold uppercase text-gray-400">After</p>
+                    <button className="text-xs font-semibold text-brand hover:underline" onClick={() => setEditing(editing === r.key ? null : r.key)} data-testid={`tr-edit-${r.key}`}>{editing === r.key ? "Done" : "Edit"}</button>
+                  </div>
+                  {editing === r.key ? (
+                    <textarea value={edits[r.key] ?? r.after} onChange={(e) => { const v = e.target.value; setEdits((x) => ({ ...x, [r.key]: v })); setKeep((k) => ({ ...k, [r.key]: true })); }}
+                      className={`${areaCls} min-h-[160px]`} data-testid={`tr-edit-area-${r.key}`} />
+                  ) : <LineDiff text={edits[r.key] ?? r.after} other={r.before} tone="after" />}
+                </div>
+              </div>
+            </Card>
+          ))}
+        </div>
+        <aside className="space-y-4 xl:sticky xl:top-24 xl:self-start">
+          {draft.missing_keywords?.length ? (
+            <Card className="space-y-2" data-testid="tr-missing-keywords">
+              <p className="font-extrabold">Keywords in the job you don't show yet</p>
+              <div className="flex flex-wrap gap-1.5">{draft.missing_keywords.map((k) => <Badge key={k} label={k} color="warning" />)}</div>
+              <p className="text-xs text-gray-500">Add one only if you genuinely have that skill or experience. Never add something untrue.</p>
+            </Card>
+          ) : null}
+          {draft.matched_keywords?.length ? (
+            <Card className="space-y-2">
+              <p className="font-extrabold">Keywords you already match</p>
+              <div className="flex flex-wrap gap-1.5">{draft.matched_keywords.map((k) => <Badge key={k} label={k} color="success" />)}</div>
+            </Card>
+          ) : null}
+          {draft.changes?.length ? <Card className="space-y-2"><p className="font-extrabold">Why these changes</p><BulletList items={draft.changes} /></Card> : null}
+          <Card className="space-y-3">
+            <p className="text-sm text-gray-600">{accepted.length} of {reviewable.length} change(s) kept.</p>
+            <Button full title="Save as new version" loading={saving} disabled={!accepted.length} onClick={save} data-testid="tr-save" />
+            <Button full variant="ghost" title="Discard all" onClick={onCancel} data-testid="tr-discard" />
+          </Card>
+        </aside>
+      </div>
+    </Page>
+  );
+}
+
 export default function ResumeEditor() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -69,6 +162,18 @@ export default function ResumeEditor() {
   const [jd, setJd] = useState("");
   const [showTailor, setShowTailor] = useState(false);
   const [showDownload, setShowDownload] = useState(false);
+  const [draft, setDraft] = useState(null);
+  const { data: savedJobs } = useQuery({ queryKey: ["saved-jobs"], queryFn: () => api("/saved-jobs"), enabled: showTailor });
+  const pickJob = async (jobId) => {
+    if (!jobId) return;
+    try {
+      const p = await api(`/career/job-prefill/${jobId}`);
+      setJd(p.jd_text);
+      if (!p.full_jd) notify("Only the job preview is available on the free plan. Paste the full description for better results.", "info");
+    } catch (e) {
+      notify(errMsg(e), "error");
+    }
+  };
 
   useEffect(() => {
     const r = data?.resume;
@@ -138,12 +243,25 @@ export default function ResumeEditor() {
   const tailor = () => step("tailor", async () => {
     const res = await api(`/career/resumes/${id}/tailor`, { method: "POST", body: { jd_text: jd } });
     await invalidate();
-    notify("Customised version saved — review the suggested changes", "success");
-    navigate(`/career/resume/${res.resume.resume_id}`, { replace: true });
+    setDraft(res.draft);
+    window.scrollTo(0, 0);
   });
 
   if (isLoading || !data) return <Spinner />;
+  if (draft) {
+    return <TailorReview draft={draft} onCancel={() => setDraft(null)} onSaved={(r) => {
+      setDraft(null);
+      notify("Tailored version saved. Your original resume is unchanged.", "success");
+      navigate(`/career/resume/${r.resume_id}`);
+    }} />;
+  }
   const notes = data.resume.notes || [];
+  const pending = data.pending_tailoring;
+  const openPending = () => step("pending", async () => {
+    const res = await api(`/career/tailor-drafts/${pending.draft_id}`);
+    setDraft(res.draft);
+    window.scrollTo(0, 0);
+  });
 
   return (
     <Page>
@@ -171,6 +289,12 @@ export default function ResumeEditor() {
               ))}
             </Card>
           ) : null}
+          {pending ? (
+            <Card className="flex flex-wrap items-center justify-between gap-3 border-brand bg-brand-mist" data-testid="re-pending-tailoring">
+              <p className="text-sm"><span className="font-extrabold">Suggested changes waiting for review</span><br />For: {pending.jd_title}</p>
+              <Button size="sm" title="Review changes" loading={busy === "pending"} onClick={openPending} data-testid="re-pending-open" />
+            </Card>
+          ) : null}
           {notes.length > 0 ? (
             <Card className="space-y-2" data-testid="re-tailor-notes">
               <p className="font-extrabold">Suggested changes for this job</p>
@@ -180,7 +304,7 @@ export default function ResumeEditor() {
           ) : null}
           <Card className="space-y-3">
             <p className="font-extrabold">Template</p>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               {STYLES.map((s) => <Chip key={s.key} label={s.name} selected={template === s.key} onClick={() => edit(() => setTemplate(s.key))} data-testid={`re-style-${s.key}`} />)}
             </div>
             <p className="text-xs text-gray-500">All templates are single-column, ATS-friendly and use standard headings.</p>
@@ -205,12 +329,18 @@ export default function ResumeEditor() {
           </div>
           <Card className="space-y-3">
             <p className="font-extrabold">Customise My Resume for a Job (optional)</p>
-            <p className="text-sm text-gray-500">Paste a job description and JobRadar will adjust your summary, skills and experience wording — only where your real background supports it. A new version is saved; this one stays unchanged.</p>
+            <p className="text-sm text-gray-500">Pick a saved JobRadar job or paste a job description. JobRadar suggests changes to your summary, skills and experience wording — only where your real background supports it. You review every change before anything is saved; this version stays unchanged.</p>
             {showTailor ? (
               <>
+                {savedJobs?.jobs?.length ? (
+                  <select className="field" defaultValue="" onChange={(e) => pickJob(e.target.value)} data-testid="re-tailor-job">
+                    <option value="">Use one of my saved jobs…</option>
+                    {savedJobs.jobs.map((j) => <option key={j.job_id} value={j.job_id}>{j.title} · {j.company}</option>)}
+                  </select>
+                ) : null}
                 <textarea value={jd} onChange={(e) => setJd(e.target.value)} maxLength={12000} className={areaCls} placeholder="Paste the complete job description" data-testid="re-tailor-jd" />
                 <UsagePill tool="resume_builder" usage={usage} />
-                <Button title="Customise My Resume" loading={busy === "tailor"} onClick={tailor} data-testid="re-tailor-submit" />
+                <Button title="Suggest Changes" loading={busy === "tailor"} onClick={tailor} data-testid="re-tailor-submit" />
               </>
             ) : (
               <Button variant="outline" title="Customise My Resume for a Job" onClick={() => setShowTailor(true)} data-testid="re-tailor-open" />

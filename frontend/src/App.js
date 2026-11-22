@@ -13,7 +13,7 @@ import Tracker from "@/pages/Tracker";
 import Matches from "@/pages/Matches";
 import { AlertManager, SmartMatchAlerts, SmartMatchAnalytics, SmartMatchCandidate, SmartMatchCandidates, SmartMatchHome, SmartMatchJob, SmartMatchReview } from "@/pages/admin/AdminSmartMatch";
 import { Forgot, Login, Register } from "@/pages/Auth";
-import { Account, Dashboard, Membership, Plans, Profile } from "@/pages/Member";
+import { Account, Dashboard, Membership, Plans, Profile, Receipt } from "@/pages/Member";
 import { About, Contact, FAQ, Legal } from "@/pages/Info";
 import { CareerHub, ResumeBuilder } from "@/pages/career/Builder";
 import ResumeEditor from "@/pages/career/ResumeEditor";
@@ -66,6 +66,7 @@ export default function App() {
               <Route path="/auth/forgot" element={<Forgot />} />
               <Route path="/plans" element={<Plans />} />
               <Route path="/membership" element={<Membership />} />
+              <Route path="/receipt/:id" element={<Receipt />} />
               <Route path="/dashboard" element={<Dashboard />} />
               <Route path="/profile" element={authed(<Profile />)} />
               <Route path="/about" element={<About />} />

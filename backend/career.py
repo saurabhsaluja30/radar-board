@@ -2,6 +2,7 @@
 
 All access rules and usage limits are enforced here on the backend.
 """
+from doctext import DocError, doc_to_text, is_doc
 import io
 import os
 import re
@@ -26,7 +27,7 @@ AI_PRICE = (3.0, 15.0)
 KINDS = ["resume_generation", "resume_analysis", "interview_sessions"]
 TOOL_KIND = {"resume_builder": "resume_generation", "resume_analyser": "resume_analysis",
              "interview_coach": "interview_sessions"}
-TIERS = ["free", "quarterly", "half_yearly", "annual"]
+TIERS = ["free", "monthly", "quarterly", "half_yearly", "annual"]
 
 DEFAULT_SETTINGS = {
     "settings_id": "career",
@@ -37,6 +38,7 @@ DEFAULT_SETTINGS = {
     },
     "limits": {
         "free": {"resume_generation": 2, "resume_analysis": 2, "interview_sessions": 1},
+        "monthly": {"resume_generation": 8, "resume_analysis": 8, "interview_sessions": 8},
         "quarterly": {"resume_generation": 15, "resume_analysis": 15, "interview_sessions": 15},
         "half_yearly": {"resume_generation": 25, "resume_analysis": 25, "interview_sessions": 25},
         "annual": {"resume_generation": 40, "resume_analysis": 40, "interview_sessions": 40},
@@ -64,6 +66,10 @@ TEMPLATES = {
                "body": 10.5, "color": "#1F3A5F", "rule": True},
     "compact": {"docx_font": "Georgia", "pdf_font": ("Times-Bold", "Times-Roman"), "name": 16, "head": 11,
                 "body": 10.5, "color": "", "rule": True},
+    "executive": {"docx_font": "Cambria", "pdf_font": ("Times-Bold", "Times-Roman"), "name": 22, "head": 12,
+                  "body": 11, "color": "#3B1F6E", "rule": True},
+    "minimal": {"docx_font": "Arial", "pdf_font": ("Helvetica-Bold", "Helvetica"), "name": 17, "head": 10.5,
+                "body": 10.5, "color": "#374151", "rule": False},
 }
 
 _inflight: set = set()
@@ -78,6 +84,13 @@ def file_to_text(name: str, data: bytes) -> str:
             from pypdf import PdfReader
             reader = PdfReader(io.BytesIO(data))
             return "\n".join((pg.extract_text() or "") for pg in reader.pages[:10])
+        if is_doc(data):
+            try:
+                return doc_to_text(data)
+            except DocError as e:
+                logger.info(f".doc not readable: {e}")
+                raise HTTPException(400, "We couldn't read this older Word (.doc) file. Please save it as .docx or "
+                                         "PDF, or copy and paste your resume text instead.")
         if n.endswith(".docx") or data[:2] == b"PK":
             from docx import Document
             d = Document(io.BytesIO(data))
@@ -86,12 +99,14 @@ def file_to_text(name: str, data: bytes) -> str:
                 for row in t.rows:
                     parts.append(" | ".join(c.text.strip() for c in row.cells if c.text.strip()))
             return "\n".join(parts)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.warning(f"resume file parse failed: {e}")
         raise HTTPException(400, "We couldn't open this file. Please upload a valid PDF or Word (.docx) file, "
                                  "or copy and paste your resume text instead.")
-    raise HTTPException(400, "Unsupported file type. Please upload a PDF or Word (.docx) file. "
-                             "Older .doc files: save as .docx or paste the text.")
+    raise HTTPException(400, "Unsupported file type. Please upload a PDF or Word (.doc or .docx) file, "
+                             "or paste the text.")
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +154,11 @@ class TailorReq(BaseModel):
     jd_text: str
 
 
+class ApplyDraftReq(BaseModel):
+    accepted: List[str]
+    edits: Optional[Dict[str, str]] = None
+
+
 class DownloadReq(BaseModel):
     format: str
 
@@ -164,6 +184,7 @@ class InterviewReq(BaseModel):
 class AnswerReq(BaseModel):
     index: int
     answer: str
+    mode: Optional[str] = "typed"  # "typed" or "voice" (browser speech-to-text; no audio reaches the server)
 
 
 class IndexReq(BaseModel):
@@ -192,6 +213,41 @@ def _clean(s: Optional[str], max_len: int) -> str:
     return (s or "").strip()[:max_len]
 
 
+def norm_sections(raw) -> list:
+    out = []
+    for s in raw or []:
+        title = _clean(s.get("title") if isinstance(s, dict) else s.title, 80)
+        content = (s.get("content") if isinstance(s, dict) else s.content) or ""
+        if isinstance(content, list):
+            content = "\n".join(f"- {c}" for c in content)
+        hint = (s.get("hint") if isinstance(s, dict) else s.hint) or ""
+        if title or str(content).strip():
+            out.append({"id": (s.get("id") if isinstance(s, dict) else s.id) or uuid.uuid4().hex[:8],
+                        "title": title, "content": str(content).strip()[:8000], "hint": _clean(hint, 600)})
+    return out
+
+
+def _key(title: str) -> str:
+    return re.sub(r"[^a-z]", "", (title or "").lower())
+
+def pair_sections(original: list, proposed: list) -> list:
+    """Line up each original section with its tailored version (matched by heading) for a before/after review."""
+    prop = {_key(p["title"]): p for p in norm_sections(proposed)}
+    rows, seen = [], set()
+    for o in original:
+        k = _key(o["title"])
+        p = prop.get(k)
+        seen.add(k)
+        after = (p or {}).get("content", o["content"])
+        rows.append({"key": o.get("id") or k, "title": o["title"], "before": o["content"], "after": after,
+                     "status": "changed" if after.strip() != (o["content"] or "").strip() else "unchanged"})
+    for k, p in prop.items():
+        if k not in seen and p["content"].strip():
+            rows.append({"key": f"new_{k}", "title": p["title"], "before": "", "after": p["content"],
+                         "status": "new"})
+    return rows
+
+
 def build_router(db, get_current_user, require_admin, compute_membership, now_utc, now_iso, parse_dt):
     r = APIRouter()
 
@@ -209,7 +265,7 @@ def build_router(db, get_current_user, require_admin, compute_membership, now_ut
             return "free"
         plan = await db.plans.find_one({"plan_id": m.get("plan_id")}, {"_id": 0, "duration_days": 1})
         days = (plan or {}).get("duration_days", 90)
-        return "annual" if days >= 365 else "half_yearly" if days >= 180 else "quarterly"
+        return "annual" if days >= 365 else "half_yearly" if days >= 180 else "quarterly" if days >= 90 else "monthly"
 
     async def usage_snapshot(user) -> dict:
         s = await get_settings()
@@ -329,19 +385,6 @@ def build_router(db, get_current_user, require_admin, compute_membership, now_ut
                         "est_cost_usd": round(it / 1e6 * AI_PRICE[0] + ot / 1e6 * AI_PRICE[1], 5)})
             await db.ai_calls.insert_one(dict(log))
 
-    def norm_sections(raw) -> list:
-        out = []
-        for s in raw or []:
-            title = _clean(s.get("title") if isinstance(s, dict) else s.title, 80)
-            content = (s.get("content") if isinstance(s, dict) else s.content) or ""
-            if isinstance(content, list):
-                content = "\n".join(f"- {c}" for c in content)
-            hint = (s.get("hint") if isinstance(s, dict) else s.hint) or ""
-            if title or str(content).strip():
-                out.append({"id": (s.get("id") if isinstance(s, dict) else s.id) or uuid.uuid4().hex[:8],
-                            "title": title, "content": str(content).strip()[:8000], "hint": _clean(hint, 600)})
-        return out
-
     async def own(coll, id_field, item_id, user):
         doc = await db[coll].find_one({id_field: item_id, "user_id": user["user_id"]}, {"_id": 0})
         if not doc:
@@ -384,7 +427,10 @@ def build_router(db, get_current_user, require_admin, compute_membership, now_ut
 
     @r.get("/career/resumes/{resume_id}")
     async def get_resume(resume_id: str, user=Depends(get_current_user)):
-        return {"resume": await own("resumes", "resume_id", resume_id, user)}
+        pending = await db.tailor_drafts.find_one(
+            {"user_id": user["user_id"], "resume_id": resume_id, "status": "pending"},
+            {"_id": 0, "draft_id": 1, "jd_title": 1, "created_at": 1}, sort=[("created_at", -1)])
+        return {"resume": await own("resumes", "resume_id", resume_id, user), "pending_tailoring": pending}
 
     @r.post("/career/resumes")
     async def create_resume(req: ResumeSaveReq, user=Depends(get_current_user)):
@@ -453,7 +499,7 @@ def build_router(db, get_current_user, require_admin, compute_membership, now_ut
         if len(text) < 150:
             raise HTTPException(400, "We couldn't read enough text from this file (it may be a scanned image). "
                                      "Please copy and paste your resume text instead.")
-        title = re.sub(r"\.(pdf|docx)$", "", file.filename or "", flags=re.I)[:60] or None
+        title = re.sub(r"\.(pdf|docx?)$", "", file.filename or "", flags=re.I)[:60] or None
         return await do_extract(user, _clean(text, 15000), f"Experienced Resume ({title})" if title else None)
 
     @r.post("/career/resumes/extract")
@@ -492,6 +538,7 @@ def build_router(db, get_current_user, require_admin, compute_membership, now_ut
 
     @r.post("/career/resumes/{resume_id}/tailor")
     async def tailor_resume(resume_id: str, req: TailorReq, user=Depends(get_current_user)):
+        """Creates a tailoring proposal only. Nothing is saved to a resume until the candidate approves changes."""
         jd = _clean(req.jd_text, 12000)
         if len(jd) < 80:
             raise HTTPException(400, "Please paste the complete job description (at least 80 characters)")
@@ -501,16 +548,57 @@ def build_router(db, get_current_user, require_admin, compute_membership, now_ut
             data = await ai_json(user, "resume_tailor",
                                  "You are an expert ATS resume writer. " + NO_INVENT +
                                  " Tailor wording, ordering and emphasis to the job description, and use the JD's "
-                                 "terminology ONLY where the candidate genuinely has that skill/experience.",
+                                 "terminology ONLY where the candidate genuinely has that skill/experience. Keep every "
+                                 "section heading exactly as given; do not add new employers, roles, dates or skills.",
                                  'Return JSON: {"changes":["short description of each suggested change and why"],'
+                                 '"matched_keywords":["important JD keywords the resume already shows"],'
+                                 '"missing_keywords":["important JD keywords or skills the resume does not show"],'
                                  f'{RESUME_SCHEMA[1:]}\n\nCURRENT RESUME SECTIONS:\n'
                                  f"{json.dumps(d['sections'], ensure_ascii=False)}\n\nJOB DESCRIPTION:\n{jd}")
-            jd_title = jd.splitlines()[0][:60]
-            notes = [_clean(c, 300) for c in (data.get("changes") or []) if isinstance(c, str)][:12]
-            doc = await save_resume(user, f"{d['title']} — tailored"[:100], d["resume_type"], d["personal"],
-                                    data.get("sections"), jd_title, "ai_tailor", d.get("template", "classic"),
-                                    d.get("missing_fields"), notes)
-            await record_usage(user, "resume_generation", doc["resume_id"])
+            words = lambda k: [_clean(x, 60) for x in (data.get(k) or []) if isinstance(x, str) and x.strip()][:20]
+            draft = {"draft_id": f"tdr_{uuid.uuid4().hex[:12]}", "user_id": user["user_id"], "resume_id": resume_id,
+                     "resume_title": d["title"], "jd_title": jd.splitlines()[0][:60],
+                     "changes": [_clean(c, 300) for c in (data.get("changes") or []) if isinstance(c, str)][:12],
+                     "matched_keywords": words("matched_keywords"), "missing_keywords": words("missing_keywords"),
+                     "sections": pair_sections(d["sections"], data.get("sections")),
+                     "status": "pending", "created_at": now_iso(), "created_dt": now_utc()}
+            await db.tailor_drafts.insert_one(dict(draft))
+            await record_usage(user, "resume_generation", draft["draft_id"])
+        draft.pop("created_dt", None)
+        return {"draft": draft}
+
+    @r.get("/career/tailor-drafts/{draft_id}")
+    async def get_draft(draft_id: str, user=Depends(get_current_user)):
+        dr = await own("tailor_drafts", "draft_id", draft_id, user)
+        dr.pop("created_dt", None)
+        return {"draft": dr}
+
+    @r.post("/career/tailor-drafts/{draft_id}/apply")
+    async def apply_draft(draft_id: str, req: ApplyDraftReq, user=Depends(get_current_user)):
+        dr = await own("tailor_drafts", "draft_id", draft_id, user)
+        if dr["status"] != "pending":
+            raise HTTPException(400, "These changes were already saved as a resume version.")
+        d = await own("resumes", "resume_id", dr["resume_id"], user)
+        accepted = set(req.accepted)
+        edited = {k: _clean(v, 8000) for k, v in (req.edits or {}).items()}
+        sections = []
+        for row in dr["sections"]:
+            take = row["key"] in accepted
+            if row["status"] == "new" and not take:
+                continue
+            content = edited.get(row["key"], row["after"]) if take else row["before"]
+            sections.append({"title": row["title"], "content": content})
+        if not accepted:
+            raise HTTPException(400, "Choose at least one change to keep, or go back without saving.")
+        claimed = await db.tailor_drafts.update_one({"draft_id": draft_id, "status": "pending"},
+                                                    {"$set": {"status": "applied", "applied_at": now_iso()}})
+        if not claimed.modified_count:
+            raise HTTPException(400, "These changes were already saved as a resume version.")
+        kept = [r["title"] for r in dr["sections"] if r["key"] in accepted]
+        doc = await save_resume(user, f"{d['title']} — tailored"[:100], d["resume_type"], d["personal"], sections,
+                                dr["jd_title"], "ai_tailor", d.get("template", "classic"), d.get("missing_fields"),
+                                [f"Kept tailored wording in: {', '.join(kept)}"] + dr["changes"][:8])
+        await db.tailor_drafts.update_one({"draft_id": draft_id}, {"$set": {"new_resume_id": doc["resume_id"]}})
         return {"resume": doc}
 
     # ------------------------------------------------------------------ export
@@ -837,6 +925,7 @@ def build_router(db, get_current_user, require_admin, compute_membership, now_ut
         if len(ans) < 5:
             raise HTTPException(400, "Please type your answer before submitting")
         upd = {f"questions.{req.index}.answer": ans, f"questions.{req.index}.status": "answered",
+               f"questions.{req.index}.answer_mode": "voice" if req.mode == "voice" else "typed",
                "updated_at": now_iso()}
         if s["feedback_mode"] == "each":
             with Lock(user, f"answer_{session_id}"):
@@ -937,6 +1026,72 @@ def build_router(db, get_current_user, require_admin, compute_membership, now_ut
             "created_at", -1).to_list(200)
         return {"sessions": items}
 
+    @r.get("/career/readiness")
+    async def readiness(user=Depends(get_current_user)):
+        """Interview readiness across completed practice sessions. Computed from saved scores; no AI call."""
+        sessions = await db.interview_sessions.find(
+            {"user_id": user["user_id"], "status": "completed", "report.empty": {"$ne": True}},
+            {"_id": 0, "session_id": 1, "job_title": 1, "interview_type": 1, "overall_score": 1, "created_at": 1,
+             "questions.category": 1, "questions.feedback.score": 1, "questions.feedback.dimensions": 1,
+             "questions.status": 1, "questions.answer_mode": 1, "report.areas_for_improvement": 1,
+             "report.topics_to_study": 1, "report.strengths": 1}).sort("created_at", -1).to_list(20)
+        analysis = await db.resume_analyses.find_one({"user_id": user["user_id"]}, {"_id": 0, "result.match_score": 1,
+                                                                                    "created_at": 1, "analysis_id": 1},
+                                                     sort=[("created_at", -1)])
+        resume = {"score": ((analysis or {}).get("result") or {}).get("match_score"),
+                  "at": (analysis or {}).get("created_at"), "analysis_id": (analysis or {}).get("analysis_id")}
+        if not sessions:
+            return {"sessions": 0, "level": "No practice yet", "score": None, "trend": [], "dimensions": [],
+                    "by_category": [], "focus": [], "strengths": [], "resume": resume, "disclaimer": AI_DISCLAIMER}
+        recent = sessions[:5]
+        weights = [5, 4, 3, 2, 1][:len(recent)]
+        score = round(sum(s["overall_score"] * w for s, w in zip(recent, weights)) / sum(weights))
+        dims: Dict[str, list] = {}
+        cats: Dict[str, list] = {}
+        voice = answered = 0
+        for s in recent:
+            for q in s.get("questions") or []:
+                if q.get("status") != "answered":
+                    continue
+                answered += 1
+                voice += q.get("answer_mode") == "voice"
+                fb = q.get("feedback") or {}
+                if fb.get("score") is not None:
+                    cats.setdefault(q.get("category") or "General", []).append(fb["score"])
+                for k, v in (fb.get("dimensions") or {}).items():
+                    try:
+                        dims.setdefault(k, []).append(max(0.0, min(10.0, float(v))) * 10)
+                    except (TypeError, ValueError):
+                        pass
+        labels = {"communication": "Communication", "relevance": "Answer relevance", "role_knowledge": "Technical / role knowledge",
+                  "structure_clarity": "Structure", "specific_examples": "Specific examples", "completeness": "Completeness"}
+        dimensions = sorted(({"key": k, "label": labels.get(k, k), "score": round(sum(v) / len(v))} for k, v in dims.items()),
+                            key=lambda d: d["score"])
+        by_category = sorted(({"category": k, "score": round(sum(v) / len(v)), "answers": len(v)} for k, v in cats.items()),
+                             key=lambda d: d["score"])
+
+        def top(field: str, n: int) -> list:
+            seen, out = set(), []
+            for s in recent:
+                for x in (s.get("report") or {}).get(field) or []:
+                    k = str(x).strip().lower()
+                    if k and k not in seen:
+                        seen.add(k)
+                        out.append(str(x).strip())
+            return out[:n]
+
+        focus = [f"Work on {d['label'].lower()} (average {d['score']}/100)" for d in dimensions[:2] if d["score"] < 70]
+        focus += top("areas_for_improvement", 4) + [f"Study: {t}" for t in top("topics_to_study", 3)]
+        level = ("Practise a little more first" if len(sessions) < 2 else
+                 "Interview ready" if score >= 80 else "Nearly ready" if score >= 65 else "Keep practising")
+        return {"sessions": len(sessions), "score": score, "level": level,
+                "trend": [{"at": s["created_at"], "score": s["overall_score"], "job_title": s.get("job_title"),
+                           "interview_type": s.get("interview_type"), "session_id": s["session_id"]} for s in reversed(sessions[:10])],
+                "dimensions": dimensions, "by_category": by_category, "focus": focus[:6], "strengths": top("strengths", 4),
+                "answers_considered": answered, "voice_answers": voice, "resume": resume,
+                "confidence_note": "Confidence isn't measured: JobRadar scores what you said, not how you sounded.",
+                "disclaimer": AI_DISCLAIMER}
+
     @r.get("/career/interviews/{session_id}")
     async def get_interview(session_id: str, user=Depends(get_current_user)):
         return {"session": await own("interview_sessions", "session_id", session_id, user)}
@@ -955,6 +1110,7 @@ def build_router(db, get_current_user, require_admin, compute_membership, now_ut
         await db.resume_analyses.delete_many(uid)
         await db.interview_sessions.delete_many(uid)
         await db.download_tokens.delete_many(uid)
+        await db.tailor_drafts.delete_many(uid)
         return {"success": True}
 
     # ------------------------------------------------------------------ saved searches

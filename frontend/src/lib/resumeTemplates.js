@@ -93,6 +93,17 @@ export const STYLES = [
   { key: "classic", name: "Classic" },
   { key: "modern", name: "Modern" },
   { key: "compact", name: "Compact" },
+  { key: "executive", name: "Executive" },
+  { key: "minimal", name: "Minimal" },
 ];
+
+// Preview look of each template; mirrors TEMPLATES in backend/career.py (fonts, accent colour, heading rule).
+export const STYLE_LOOK = {
+  classic: { font: undefined, accent: "#111111", rule: true, name: "text-2xl" },
+  modern: { font: undefined, accent: "#1F3A5F", rule: true, name: "text-2xl" },
+  compact: { font: "Georgia, serif", accent: "#111111", rule: true, name: "text-xl" },
+  executive: { font: "Cambria, Georgia, serif", accent: "#3B1F6E", rule: true, name: "text-3xl" },
+  minimal: { font: "Arial, Helvetica, sans-serif", accent: "#374151", rule: false, name: "text-xl" },
+};
 
 export const NEW_ROLE_BLOCK = "Job Title | Company | Mon YYYY – Mon YYYY\n- ";

@@ -226,8 +226,9 @@ export function AdminDemand() {
 }
 
 const STAGES = [["saved", "Jobs saved / tracked"], ["contacted", "Contacted recruiters"], ["applied", "Independently applied"],
-  ["responded", "Recruiter responses"], ["interview_scheduled", "Interview calls received"], ["interview_completed", "Interviews completed"],
-  ["offer_received", "Offers received"], ["hired", "Reported hired"]];
+  ["resume_viewed", "Resume viewed (verified)"], ["responded", "Recruiter responses"], ["shortlisted", "Shortlisted"],
+  ["interview_scheduled", "Interview calls received"], ["interview_completed", "Interviews completed"], ["selected", "Selected"],
+  ["offer_received", "Offers received"], ["hired", "Reported joined"]];
 
 function EvidenceViewer({ ev, onClose }) {
   const { data: url, isLoading, isError } = useQuery({
@@ -327,6 +328,13 @@ export function AdminSuccess() {
                         <td className="pr-3"><p className="font-semibold">{t.designation}</p><p className="text-xs text-gray-500">{t.company} · {t.location} · {t.job_id}</p></td>
                         <td className="pr-3"><Badge label={t.status_label} color="brand" /><p className="mt-1 text-xs text-gray-400">updated {formatDate(t.updated_at)}</p></td>
                         <td className="space-y-2 pr-3">
+                          {t.resume_viewed_verification ? (
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="text-xs">Resume viewed</span>{vBadge(t.resume_viewed_verification)}
+                              <Button size="sm" variant="ghost" title={t.resume_viewed_verification === "verified" ? "Unverify" : "Verify"} icon={<ShieldCheck className="h-3.5 w-3.5" />}
+                                onClick={() => verify(t, "resume_viewed", t.resume_viewed_verification !== "verified")} data-testid={`verify-resume-viewed-${t.tracker_id}`} />
+                            </div>
+                          ) : null}
                           {t.interview_verification ? (
                             <div className="flex flex-wrap items-center gap-2">
                               <span className="text-xs">Interview {formatDate(t.interview?.date)} ({t.interview?.mode})</span>{vBadge(t.interview_verification)}
@@ -341,7 +349,7 @@ export function AdminSuccess() {
                                 onClick={() => verify(t, "hire", t.hire_verification !== "verified")} data-testid={`verify-hire-${t.tracker_id}`} />
                             </div>
                           ) : null}
-                          {!t.interview_verification && !t.hire_verification ? <span className="text-xs text-gray-400">—</span> : null}
+                          {!t.interview_verification && !t.hire_verification && !t.resume_viewed_verification ? <span className="text-xs text-gray-400">—</span> : null}
                         </td>
                         <td>
                           {t.evidence.length === 0 ? <span className="text-xs text-gray-400">None</span> : t.evidence.map((e) => (

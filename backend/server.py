@@ -27,6 +27,7 @@ mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ["DB_NAME"]]
 import ops as _ops  # noqa: E402
+from payments import payment_mode  # noqa: E402
 _ops.init(db)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -827,12 +828,67 @@ async def get_config():
     }
 
 
+# Final paid membership catalogue (Nov 2026). The free tier is not a plan record and is untouched by this.
+PLAN_CATALOGUE = [
+    {"tier": "monthly", "name": "Monthly Plan", "price": 599, "duration_days": 30, "featured": False,
+     "tagline": "Try JobRadar for a month"},
+    {"tier": "quarterly", "name": "Quarterly Plan", "price": 1499, "duration_days": 90, "featured": False,
+     "tagline": "Made for an active job search"},
+    {"tier": "half_yearly", "name": "Half-Yearly Plan", "price": 1999, "duration_days": 180, "featured": False,
+     "tagline": "More time, lower monthly cost"},
+    {"tier": "annual", "name": "Annual Plan", "price": 2499, "duration_days": 365, "featured": True,
+     "best_value": True, "tagline": "Best value: about ₹208 a month"},
+]
+PLAN_FEATURES = ["Full job details and direct employer application links",
+                 "SmartMatch recommendations and in-app job alerts",
+                 "Application Tracker with reminders",
+                 "Save unlimited jobs"]
+
+
+def plan_tier(duration_days) -> str:
+    d = int(duration_days or 0)
+    return "annual" if d >= 365 else "half_yearly" if d >= 180 else "quarterly" if d >= 90 else "monthly"
+
+
+async def _migrate_plan_catalogue():
+    """Adds the four catalogue plans once. Older plans with the same duration are switched off (never deleted),
+    so existing subscriptions keep their plan, price paid and expiry. Safe to run on both replicas."""
+    from pymongo.errors import DuplicateKeyError
+    await db.plans.create_index("tier", unique=True, name="plan_tier_unique",
+                                partialFilterExpression={"tier": {"$type": "string"}})
+    for p in PLAN_CATALOGUE:
+        doc = {"plan_id": f"plan_{p['tier']}_{uuid.uuid4().hex[:6]}", "currency": "INR", "active": True,
+               "best_value": False, "created_at": now_iso(), "updated_at": now_iso(), **p}
+        try:
+            res = await db.plans.update_one({"tier": p["tier"]}, {"$setOnInsert": doc}, upsert=True)
+        except DuplicateKeyError:
+            continue
+        if res.upserted_id is None:
+            continue
+        retired = await db.plans.update_many(
+            {"tier": {"$exists": False}, "duration_days": p["duration_days"], "active": True},
+            {"$set": {"active": False, "retired_at": now_iso(), "replaced_by": doc["plan_id"],
+                      "updated_at": now_iso()}})
+        logger.info(f"Added {p['name']} (₹{p['price']}); retired {retired.modified_count} older plan(s)")
+
+
+async def _plan_extras(plans: list) -> list:
+    s = await db.career_settings.find_one({"settings_id": "career"}, {"_id": 0, "limits": 1}) or {}
+    limits = s.get("limits") or {}
+    for p in plans:
+        tier = p.get("tier") or plan_tier(p.get("duration_days"))
+        p["features"] = p.get("features") or PLAN_FEATURES
+        p["ai_limits"] = limits.get(tier)
+    return plans
+
+
 @api.get("/plans")
 async def get_plans():
     if (await get_launch()).get("plans_hidden"):
         return {"plans": [], "plans_hidden": True}
     plans = await db.plans.find({"active": True}, {"_id": 0}).sort("duration_days", 1).to_list(50)
-    return {"plans": plans, "plans_hidden": False}
+    return {"plans": await _plan_extras(plans), "plans_hidden": False,
+            "payments": payment_mode()}
 
 
 @api.get("/jobs")
@@ -957,11 +1013,17 @@ async def apply_click(job_id: str, user=Depends(get_current_user)):
 @api.get("/membership")
 async def membership(user=Depends(get_current_user)):
     m = await compute_membership(user["user_id"])
+    if m.get("plan_id"):
+        cur = await db.plans.find_one({"plan_id": m["plan_id"]}, {"_id": 0, "duration_days": 1})
+        m["plan_duration_days"] = (cur or {}).get("duration_days")
     payments = await db.payments.find({"candidate_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
     plans = await db.plans.find({"active": True}, {"_id": 0}).sort("duration_days", 1).to_list(50)
     if (await get_launch()).get("plans_hidden"):
         plans = []
-    return {"membership": m, "payments": payments, "plans": plans}
+    for p in payments:
+        p.pop("mismatch", None)
+        p.pop("activation", None)
+    return {"membership": m, "payments": payments, "plans": await _plan_extras(plans), "payments_mode": payment_mode()}
 
 
 @api.get("/payments")
@@ -978,7 +1040,13 @@ async def _activate_subscription(candidate_id: str, plan: dict, is_demo: bool, p
     - No active plan -> starts today."""
     current = await compute_membership(candidate_id)
     duration = int(plan["duration_days"])
-    is_upgrade = bool(current["is_active"] and current.get("plan_id") and current["plan_id"] != plan["plan_id"])
+    # Buying a plan of the same length counts as a renewal even when the plan record changed (for example a
+    # retired Quarterly plan renewed with the current one), so remaining days are never lost.
+    cur_days = None
+    if current["is_active"] and current.get("plan_id") and current["plan_id"] != plan["plan_id"]:
+        cur = await db.plans.find_one({"plan_id": current["plan_id"]}, {"_id": 0, "duration_days": 1})
+        cur_days = int((cur or {}).get("duration_days") or 0)
+    is_upgrade = bool(cur_days is not None and cur_days != duration)
     if current["is_active"] and current.get("expiry_date") and not is_upgrade:
         start = parse_dt(current["expiry_date"]) or now_utc()
         base_start = parse_dt(current.get("start_date")) or now_utc()
@@ -1105,11 +1173,13 @@ async def admin_launch_approve(user_id: str, admin=Depends(require_admin)):
     return {"success": True, "membership": m}
 
 
-@api.post("/checkout/demo")
-async def checkout_demo(req: CheckoutReq, user=Depends(get_current_user)):
+async def _checkout_plan(user: dict, plan_id: str) -> dict:
+    """Checks shared by every checkout: plans on sale, plan exists, candidate account, no switch to a shorter plan."""
+    if user.get("role") != "candidate":
+        raise HTTPException(status_code=403, detail="Only candidate accounts can buy a membership.")
     if (await get_launch()).get("plans_hidden"):
         raise HTTPException(status_code=400, detail="Membership plans are not available right now.")
-    plan = await db.plans.find_one({"plan_id": req.plan_id, "active": True}, {"_id": 0})
+    plan = await db.plans.find_one({"plan_id": plan_id, "active": True}, {"_id": 0})
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
     current = await compute_membership(user["user_id"])
@@ -1119,6 +1189,15 @@ async def checkout_demo(req: CheckoutReq, user=Depends(get_current_user)):
             raise HTTPException(status_code=400, detail=(
                 "You can switch to a shorter plan after your current plan expires. "
                 "Renew your current plan or upgrade to a longer plan."))
+    return plan
+
+
+@api.post("/checkout/demo")
+async def checkout_demo(req: CheckoutReq, user=Depends(get_current_user)):
+    # Simulated payments exist only while Razorpay is not configured (local and staging without keys).
+    if payment_mode()["gateway"] == "razorpay":
+        raise HTTPException(status_code=403, detail="Please complete payment through Razorpay checkout.")
+    plan = await _checkout_plan(user, req.plan_id)
     order_id = f"order_demo_{uuid.uuid4().hex[:12]}"
     payment_id = f"pay_demo_{uuid.uuid4().hex[:12]}"
     payment = {
@@ -1778,9 +1857,8 @@ async def _seed_international_jobs():
 
 async def seed():
     # --- idempotent, non-destructive migrations for existing data ---
-    await db.plans.update_many({"duration_days": 180}, {"$set": {"price": 799}})
-    await db.plans.update_many({"duration_days": 365}, {"$set": {"price": 999}})
-    await db.plans.update_many({"duration_days": 90}, {"$set": {"price": 599}})
+    # Plan prices are no longer forced here on every start: they live in the plans collection and admins edit them.
+    await _migrate_plan_catalogue()
     await db.jobs.update_many({"region": {"$exists": False}}, {"$set": {"region": "India"}})
     await db.jobs.update_many({"currency": {"$exists": False}}, {"$set": {"currency": "INR"}})
     try:
@@ -1800,25 +1878,11 @@ async def seed():
                                   {"$set": {"industry_category": _dst}})
     await db.jobs.update_many({"industry_category": {"$exists": False}}, {"$set": {"industry_category": "Other"}})
     await _seed_international_jobs()
-    # Career Tools plan limits: Quarterly 15, Half-Yearly 25, Annual 40 (per plan purchase)
-    for _tier, _n in (("quarterly", 15), ("half_yearly", 25), ("annual", 40)):
-        await db.career_settings.update_one({"settings_id": "career"}, {"$set": {
-            f"limits.{_tier}": {"resume_generation": _n, "resume_analysis": _n, "interview_sessions": _n}}})
-
-    if await db.plans.count_documents({}) == 0:
-        base_plans = [
-            {"name": "Quarterly Plan", "price": 599, "duration_days": 90, "featured": True,
-             "tagline": "Recommended starter"},
-            {"name": "Half-Yearly Plan", "price": 799, "duration_days": 180, "featured": False,
-             "tagline": "Great value"},
-            {"name": "Annual Plan", "price": 999, "duration_days": 365, "featured": False,
-             "tagline": "Best long-term value"},
-        ]
-        for p in base_plans:
-            await db.plans.insert_one({
-                "plan_id": f"plan_{uuid.uuid4().hex[:8]}", "currency": "INR", "active": True,
-                "created_at": now_iso(), "updated_at": now_iso(), **p})
-        logger.info("Seeded plans")
+    # Career Tools plan limits (per plan purchase). Only filled in when missing, so admin changes are kept.
+    for _tier, _n in (("monthly", 8), ("quarterly", 15), ("half_yearly", 25), ("annual", 40)):
+        await db.career_settings.update_one(
+            {"settings_id": "career", f"limits.{_tier}": {"$exists": False}},
+            {"$set": {f"limits.{_tier}": {"resume_generation": _n, "resume_analysis": _n, "interview_sessions": _n}}})
 
     if await db.jobs.count_documents({}) == 0:
         for i, (title, company, func, sub, ind, loc, exp, sal, mode) in enumerate(SAMPLE_JOBS):
@@ -1936,6 +2000,10 @@ async def startup():
         await db.match_queue.create_index("queue_id", unique=True)
         await db.match_queue.create_index("done_at", expireAfterSeconds=7 * 24 * 3600)
         await _ops.ensure_indexes(db)
+        await _payment_indexes(db)
+        # Resume tailoring proposals: reviewed within days; unapproved ones are removed after 7 days.
+        await db.tailor_drafts.create_index("draft_id", unique=True)
+        await db.tailor_drafts.create_index("created_dt", expireAfterSeconds=7 * 24 * 3600)
     except Exception as e:
         logger.warning(f"Index creation: {e}")
     await seed()
@@ -1990,6 +2058,9 @@ from apify_jobs import build_router as _build_apify_router, dedupe_key as _dedup
 
 _apify_router, _apify_helpers = _build_apify_router(db, require_admin, audit_log, now_iso, _bg, _sm_helpers)
 api.include_router(_apify_router)
+from payments import build_router as _build_payments_router, ensure_indexes as _payment_indexes  # noqa: E402
+api.include_router(_build_payments_router(db, get_current_user, require_admin, _checkout_plan, _activate_subscription,
+                                          send_and_log_email, _wrap_email, now_iso, audit_log))
 _ops_router, _ = _ops.build_router(db, require_admin, live_job_q)
 api.include_router(_ops_router)
 app.include_router(api)
