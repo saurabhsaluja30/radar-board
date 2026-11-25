@@ -130,6 +130,30 @@ def _date(v) -> Optional[str]:
         return m.group(0) if m else None
 
 
+# ATS actors report countries as ISO 3166 alpha-2 codes ("IN"); others use names ("India").
+COUNTRY_CODES = {
+    "IN": "India", "US": "United States", "GB": "United Kingdom", "UK": "United Kingdom", "AE": "United Arab Emirates",
+    "SG": "Singapore", "CA": "Canada", "AU": "Australia", "DE": "Germany", "FR": "France", "NL": "Netherlands",
+    "IE": "Ireland", "SA": "Saudi Arabia", "QA": "Qatar", "JP": "Japan", "MY": "Malaysia", "PH": "Philippines",
+    "NZ": "New Zealand", "ES": "Spain", "IT": "Italy", "PL": "Poland", "BR": "Brazil", "MX": "Mexico",
+    "HK": "Hong Kong", "ID": "Indonesia", "TH": "Thailand", "VN": "Vietnam", "KR": "South Korea", "CH": "Switzerland",
+    "SE": "Sweden", "PT": "Portugal", "IL": "Israel", "ZA": "South Africa", "EG": "Egypt", "KE": "Kenya", "NG": "Nigeria",
+}
+INDIA_CITIES = re.compile(r"\b(bangalore|bengaluru|mumbai|delhi|new delhi|gurgaon|gurugram|noida|hyderabad|chennai|pune|"
+                          r"kolkata|ahmedabad|jaipur|kochi|chandigarh|indore|coimbatore|thiruvananthapuram|trivandrum|"
+                          r"navi mumbai|thane|mysore|mysuru|vadodara|lucknow|bhubaneswar|nagpur|surat|visakhapatnam)\b", re.I)
+
+
+def _country(item: dict, location: str) -> str:
+    raw = _first(item, "countries", "countries_derived", "country")
+    name = str(raw or "").strip()
+    if len(name) == 2 and name.isalpha():
+        name = COUNTRY_CODES.get(name.upper(), name.upper())
+    if not name and INDIA_CITIES.search(location or ""):
+        name = "India"
+    return name[:60]
+
+
 def normalise(item: dict) -> dict:
     """Map one Actor dataset item onto JobRadar job fields. Only values present in the item are used."""
     desc = _first(item, "descriptionText", "description_text", "description")
@@ -139,7 +163,7 @@ def normalise(item: dict) -> dict:
     title = str(_first(item, "title", "jobTitle", "position") or "").strip()[:160]
     company = str(_first(item, "company", "organization", "companyName", "org_linkedin_name") or "").strip()[:120]
     location = str(_first(item, "location", "locations_derived", "allLocations", "cities_derived") or "").strip()[:160]
-    country = str(_first(item, "countries", "countries_derived", "country") or "").strip()[:60]
+    country = _country(item, location)
     url = norm_url(_first(item, "url", "jobUrl", "link"))
     apply_url = _first(item, "applyUrl", "apply_url") or _first(item, "url", "jobUrl")
     smin = _first(item, "salaryMin", "ai_salary_min_value")
@@ -498,6 +522,26 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
             bg(tracked("apify-daily", daily_cycle()))
         return {"accepted": True}
 
+    async def poll_pending() -> int:
+        """Import any finished runs. Covers deployments without the Apify webhook (no PUBLIC_BACKEND_URL) and
+        webhooks that never arrived, so results land within one poll interval instead of the next day."""
+        n = 0
+        for doc in await db.apify_runs.find({"processed": False, "apify_run_id": {"$ne": None}},
+                                            {"_id": 0, "run_id": 1}).to_list(20):
+            try:
+                res = await finalize(doc["run_id"])
+                n += 1 if res and res.get("status") in FINAL_STATES else 0
+            except Exception:  # noqa: BLE001 - logged in finalize; retried next poll
+                pass
+        return n
+
+    @r.post("/cron/apify-poll")
+    async def cron_poll(authorization: Optional[str] = Header(None)):
+        check_secret(authorization[7:] if authorization and authorization.startswith("Bearer ") else None, "WEBHOOK_CRON_SECRET")
+        if token() and await db.apify_runs.find_one({"processed": False, "apify_run_id": {"$ne": None}}, {"_id": 1}):
+            bg(tracked("apify-poll", poll_pending()))
+        return {"accepted": True}
+
     @r.post("/apify/webhook")
     async def webhook(request: Request, x_jobradar_webhook: Optional[str] = Header(None)):
         check_secret(x_jobradar_webhook, "APIFY_WEBHOOK_SECRET")
@@ -721,4 +765,4 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
             await audit_log(admin, f"import_{req.action}", "job", ",".join(done)[:200], {"count": len(done)})
         return {"done": done, "skipped": skipped}
 
-    return r, {"daily_cycle": daily_cycle}
+    return r, {"daily_cycle": daily_cycle, "poll_pending": poll_pending}

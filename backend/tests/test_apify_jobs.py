@@ -70,6 +70,29 @@ def test_normalise_fantastic_jobs_shape():
     assert n["salary_min"] == 500000 and n["currency"] == "INR" and n["original_posted_at"] == "2026-11-01"
 
 
+ZETA_DESC = ("Zeta is a next-generation banking technology company. Responsibilities: deploy and manage container "
+             "orchestration, service mesh and CI/CD. Skills: Kubernetes, Terraform, Python. Experience: 2-8 years of "
+             "relevant work experience in distributed systems and micro-service based architectures.")
+
+
+def test_normalise_real_ats_jobs_search_item():
+    """Shape copied from a real yugenox/ats-jobs-search run (Nov 2026): countries come as ISO codes."""
+    real = {"ats": "lever", "company": "Zeta", "companyToken": "zeta", "jobId": "f827a249-2537-4f7f-aade-25b829fc13f2",
+            "title": "Site Reliability Engineer- II", "url": "https://jobs.lever.co/zeta/f827a249-2537-4f7f-aade-25b829fc13f2",
+            "applyUrl": "https://jobs.lever.co/zeta/f827a249-2537-4f7f-aade-25b829fc13f2/apply", "location": "Bangalore",
+            "allLocations": ["Bangalore"], "countries": ["IN"], "workplaceType": "onsite", "isRemote": False,
+            "employmentType": "full-time", "postedAt": _today().isoformat() + "T13:09:24.922Z", "applicationDeadline": None,
+            "salaryMin": None, "salaryMax": None, "salaryCurrency": None, "salaryText": None, "descriptionText": ZETA_DESC,
+            "internalJobId": None, "companyBoardUrl": "https://jobs.lever.co/zeta"}
+    n = normalise(real)
+    assert n["country"] == "India" and n["region"] == "India", "ISO code IN must count as India"
+    assert (n["city"], n["work_mode"], n["employment_type"]) == ("Bangalore", "Work From Office", "Full-time")
+    assert n["application_link"].endswith("/apply") and n["external_id"] == real["jobId"]
+    assert n["experience_min"] == 2 and n["experience_max"] == 8 and n["flags"] == []
+    assert normalise({**real, "countries": ["US"], "location": "New York"})["region"] == "International"
+    assert normalise({**real, "countries": [], "location": "Gurugram"})["region"] == "India"
+
+
 # --------------------------------------------------------------------------- fake Apify API
 class Fake:
     items: list = []
@@ -239,6 +262,29 @@ class TestApifyFlow:
         r = requests.post(f"{api}/admin/sources/run", headers=h, json={"source_ids": [sid]})
         assert r.status_code == 409 and "budget" in r.json()["detail"]
         self.db.jobs.delete_one({"job_id": manual["job_id"]})
+
+    def test_poll_imports_a_run_without_webhook(self):
+        api, h = self.api, self.h
+        self.settings()
+        r = requests.post(f"{api}/admin/sources", headers=h, json={
+            "name": "TEST_APIFY Poll Co", "url": "https://jobs.lever.co/testapifypoll", "enabled": True,
+            "permission_status": "Approved", "permission_note": "Public Lever board"})
+        assert r.status_code == 200, r.text
+        sid = r.json()["source"]["source_id"]
+        Fake.items, Fake.events, Fake.status = [item(91, company="TEST_APIFY Poll Co", countries=["IN"], location="Pune")], 1, "SUCCEEDED"
+        run = requests.post(f"{api}/admin/sources/run", headers=h, json={"source_ids": [sid]}).json()["runs"][0]
+        secret = os.environ.get("WEBHOOK_CRON_SECRET", "local-dev-cron-secret")
+        assert requests.post(f"{api}/cron/apify-poll", headers={"Authorization": "Bearer wrong"}).status_code == 401
+        # No webhook is sent: the poll alone must import the finished run.
+        assert requests.post(f"{api}/cron/apify-poll", headers={"Authorization": f"Bearer {secret}"}).status_code == 200
+        for _ in range(40):
+            doc = self.db.apify_runs.find_one({"run_id": run["run_id"]})
+            if doc.get("processed"):
+                break
+            time.sleep(0.25)
+        assert doc["processed"] and doc["summary"]["created"] == 1
+        job = self.db.jobs.find_one({"source_id": sid})
+        assert job["region"] == "India" and job["country"] == "India" and job["review_status"] == "new_import"
 
     def test_cron_once_per_day(self):
         secret = os.environ.get("WEBHOOK_CRON_SECRET", "local-dev-cron-secret")

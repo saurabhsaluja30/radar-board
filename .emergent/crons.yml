@@ -15,3 +15,35 @@ crons:
     endpoint: "{{BASE_URL}}/api/cron/email-retry"
     method: POST
     enabled: true
+  - name: apify-daily
+    description: "Daily Apify job collection: import finished runs, sweep expired jobs, start runs for due approved sources (within budget; runs only after an admin approves paid runs)"
+    cron: "0 6 * * *"
+    timezone: "Asia/Kolkata"
+    # Cron endpoints must ack 2xx immediately; enqueue/background the actual work.
+    endpoint: "{{BASE_URL}}/api/cron/apify-daily"
+    method: POST
+    enabled: true
+  - name: smartmatch-queue
+    description: "Every 10 minutes, rescore matches for jobs and candidates whose match-relevant fields changed (incl. newly published imports)"
+    cron: "*/10 * * * *"
+    timezone: "Asia/Kolkata"
+    # Cron endpoints must ack 2xx immediately; enqueue/background the actual work.
+    endpoint: "{{BASE_URL}}/api/cron/smartmatch-queue"
+    method: POST
+    enabled: true
+  - name: resume-retry
+    description: "Every 15 minutes, retry resume parses that failed or got stuck (max 3 attempts each)"
+    cron: "*/15 * * * *"
+    timezone: "Asia/Kolkata"
+    # Cron endpoints must ack 2xx immediately; enqueue/background the actual work.
+    endpoint: "{{BASE_URL}}/api/cron/resume-retry"
+    method: POST
+    enabled: true
+  - name: apify-poll
+    description: "Every 15 minutes, import Apify runs that have finished (backup for the Apify webhook; does nothing when no run is pending)"
+    cron: "*/15 * * * *"
+    timezone: "Asia/Kolkata"
+    # Cron endpoints must ack 2xx immediately; enqueue/background the actual work.
+    endpoint: "{{BASE_URL}}/api/cron/apify-poll"
+    method: POST
+    enabled: true
