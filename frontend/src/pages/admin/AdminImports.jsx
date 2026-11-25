@@ -4,38 +4,49 @@ import { useQuery } from "@tanstack/react-query";
 import { ExternalLink } from "lucide-react";
 import { api } from "@/lib/api";
 import { formatDate, INDUSTRIES_WITH_OTHER as CATEGORIES } from "@/lib/constants";
-import { Badge, Button, Card, EmptyState, errMsg, Input, Modal, notify, PageHeader, Spinner, Switch } from "@/components/kit";
+import { Badge, Button, Card, Chip, EmptyState, errMsg, Input, Modal, notify, PageHeader, Spinner, Switch } from "@/components/kit";
 
 const Th = ({ children }) => <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wide text-gray-400">{children}</th>;
 const Td = ({ children, className = "" }) => <td className={`px-4 py-3.5 align-top text-sm ${className}`}>{children}</td>;
 const RUN_COLOR = { SUCCEEDED: "success", FAILED: "error", ABORTED: "error", "TIMED-OUT": "error", RUNNING: "warning", READY: "warning", STARTING: "warning" };
 const PERM_COLOR = { Approved: "success", "Pending review": "warning", "Not permitted": "error" };
 const FLAG_LABEL = { incomplete: "Incomplete", suspicious: "Suspicious", old_posting: "Old posting", possible_duplicate: "Possible duplicate",
-  closed_at_source: "Closed at source", source_changed: "Changed at source", experience_mismatch: "Experience doesn't fit search" };
+  closed_at_source: "Closed at source", source_changed: "Changed at source" };
 const REVIEW_TABS = [["new_import", "New imports"], ["pending_review", "Pending review"], ["approved", "Approved"], ["rejected", "Rejected"], ["archived", "Archived"], ["All", "All"]];
 const usd = (n) => `$${Number(n || 0).toFixed(n < 1 ? 3 : 2)}`;
 const toList = (s) => (Array.isArray(s) ? s : String(s || "").split(",").map((x) => x.trim()).filter(Boolean));
 const EMPTY_SRC = { name: "", url: "", source_type: "Employer career page", permission_status: "Pending review", permission_note: "",
-  enabled: false, frequency: "daily", category: "", keywords: "", locations: "" };
+  enabled: false, frequency: "daily", category: "", keywords: "", locations: "", filters: {} };
 
 function Field({ label, children }) {
   return <label className="block"><span className="label">{label}</span><div className="mt-1.5">{children}</div></label>;
 }
 
+const FILTER_LABEL = { experience: "Experience level", work_mode: "Work mode", employment: "Employment type" };
+
 function SourceModal({ src, options, onClose, onSaved }) {
   const [f, setF] = useState(EMPTY_SRC);
   const [busy, setBusy] = useState(false);
-  useEffect(() => { if (src) setF({ ...EMPTY_SRC, ...src, category: src.category || "", keywords: toList(src.keywords).join(", "), locations: toList(src.locations).join(", ") }); }, [src]);
+  useEffect(() => { if (src) setF({ ...EMPTY_SRC, ...src, filters: src.filters || {}, category: src.category || "", keywords: toList(src.keywords).join(", "), locations: toList(src.locations).join(", ") }); }, [src]);
   const set = (k) => (e) => setF((x) => ({ ...x, [k]: e?.target ? e.target.value : e }));
+  const search = f.source_type === options.search_type;
+  const toggleFilter = (k, v) => setF((x) => {
+    const cur = (x.filters || {})[k] || [];
+    return { ...x, filters: { ...(x.filters || {}), [k]: cur.includes(v) ? cur.filter((y) => y !== v) : [...cur, v] } };
+  });
+  const setType = (e) => {
+    const t = e.target.value;
+    setF((x) => ({ ...x, source_type: t, ...(t === options.search_type && !src?.source_id ? { permission_status: "Approved", url: "" } : {}) }));
+  };
   const save = async () => {
     setBusy(true);
     try {
-      const body = { ...f, category: f.category || null, keywords: toList(f.keywords), locations: toList(f.locations) };
+      const body = { ...f, category: f.category || null, keywords: toList(f.keywords), locations: toList(f.locations), filters: search ? f.filters || {} : {} };
       ["source_id", "date_added", "last_checked_at", "last_success_at", "jobs_imported", "failed_attempts", "last_error", "added_by",
-        "updated_at", "jobs_total", "jobs_awaiting", "jobs_published"].forEach((k) => delete body[k]);
+        "updated_at", "jobs_total", "jobs_awaiting", "jobs_published", "managed", "demand_pairs", "demand_refreshed_at"].forEach((k) => delete body[k]);
       if (src?.source_id) await api(`/admin/sources/${src.source_id}`, { method: "PUT", body });
       else await api("/admin/sources", { method: "POST", body });
-      notify("Source saved", "success");
+      notify(search ? "Job search saved" : "Source saved", "success");
       onSaved();
     } catch (e) {
       notify(errMsg(e), "error");
@@ -46,24 +57,94 @@ function SourceModal({ src, options, onClose, onSaved }) {
   return (
     <Modal open={!!src} onClose={onClose} wide>
       <div className="space-y-4" data-testid="source-modal">
-        <p className="h-sec">{src?.source_id ? "Edit job source" : "Add approved job source"}</p>
+        <p className="h-sec">{src?.source_id ? (search ? "Edit job search" : "Edit job source") : (search ? "Add a job search" : "Add approved job source")}</p>
         <div className="grid gap-3 md:grid-cols-2">
-          <Input label="Source name" placeholder="e.g. Acme Careers" value={f.name} onChange={set("name")} data-testid="src-name" />
-          <Input label="Source URL" placeholder="https://job-boards.greenhouse.io/acme" value={f.url} onChange={set("url")} data-testid="src-url" />
-          <Field label="Source type"><select className="field" value={f.source_type} onChange={set("source_type")}>{options.source_types.map((o) => <option key={o}>{o}</option>)}</select></Field>
+          <Input label={search ? "Search name" : "Source name"} placeholder={search ? "e.g. Travel consultants – Mumbai" : "e.g. Acme Careers"} value={f.name} onChange={set("name")} data-testid="src-name" />
+          <Field label="Source type"><select className="field" value={f.source_type} onChange={setType} data-testid="src-type">{options.source_types.map((o) => <option key={o}>{o}</option>)}</select></Field>
+          {search ? (
+            <>
+              <Input label="Job titles *" placeholder="e.g. Travel Consultant, Ticketing Executive" value={f.keywords} onChange={set("keywords")} data-testid="src-keywords" />
+              <Input label="Locations *" placeholder="e.g. Mumbai, Pune, Remote" value={f.locations} onChange={set("locations")} data-testid="src-locations" />
+            </>
+          ) : (
+            <>
+              <Input className="md:col-span-2" label="Source URL" placeholder="https://job-boards.greenhouse.io/acme" value={f.url} onChange={set("url")} data-testid="src-url" />
+              <Input label="Job-title keywords (optional)" placeholder="Leave empty to use the defaults" value={f.keywords} onChange={set("keywords")} />
+              <Input label="Locations (optional)" placeholder="e.g. India, Dubai" value={f.locations} onChange={set("locations")} />
+            </>
+          )}
           <Field label="Permission status"><select className="field" value={f.permission_status} onChange={set("permission_status")} data-testid="src-permission">{options.permission.map((o) => <option key={o}>{o}</option>)}</select></Field>
-          <Input className="md:col-span-2" label="Permission / authorisation note" placeholder="e.g. Public Greenhouse job board; terms allow reuse" value={f.permission_note} onChange={set("permission_note")} />
           <Field label="Collection frequency"><select className="field" value={f.frequency} onChange={set("frequency")}>{options.frequency.map((o) => <option key={o}>{o}</option>)}</select></Field>
           <Field label="Job category for imports"><select className="field" value={f.category} onChange={set("category")}><option value="">Set during review</option>{CATEGORIES.map((o) => <option key={o}>{o}</option>)}</select></Field>
-          <Input label="Job-title keywords (optional)" placeholder="Leave empty to use the defaults" value={f.keywords} onChange={set("keywords")} />
-          <Input label="Locations (optional)" placeholder="e.g. India, Dubai" value={f.locations} onChange={set("locations")} />
+          <Input label="Note (optional)" placeholder={search ? "e.g. Requested by the travel desk" : "e.g. Public Greenhouse job board; terms allow reuse"} value={f.permission_note} onChange={set("permission_note")} />
         </div>
+        {search ? (
+          <div className="space-y-3" data-testid="src-filters">
+            {Object.entries(options.filters || {}).map(([k, vals]) => (
+              <div key={k}><p className="label">{FILTER_LABEL[k] || k} <span className="font-normal text-gray-400">(optional, any of)</span></p>
+                <div className="mt-1.5 flex flex-wrap gap-2">{vals.map((v) => <Chip key={v} label={v} selected={((f.filters || {})[k] || []).includes(v)} onClick={() => toggleFilter(k, v)} data-testid={`src-filter-${k}-${v}`} />)}</div></div>
+            ))}
+          </div>
+        ) : null}
         <label className="flex items-center justify-between rounded-xl bg-brand-mist p-4 text-sm font-semibold">Enabled for collection
           <Switch checked={f.enabled} onChange={set("enabled")} data-testid="src-enabled" /></label>
-        <p className="text-xs text-gray-500">Only add sources that permit automated collection: an employer's own careers page or job board, an authorised API or feed, or a licensed provider. LinkedIn URLs are collected with the LinkedIn Actor (bebity/linkedin-jobs-scraper): use a company page (linkedin.com/company/…) to get that company's jobs, a LinkedIn job-search URL, or https://www.linkedin.com/jobs for a search by the keywords and locations above. Naukri and similar portals can't be added without a licence.</p>
-        <Button title="Save source" loading={busy} onClick={save} data-testid="src-save" />
+        {search ? (
+          <p className="text-xs text-gray-500">No URL needed: the LinkedIn Actor searches LinkedIn for each job title in each location (only jobs posted within the period in Apify settings) and imports what it finds into the review queue. Cost is about $0.0015 per job, within the monthly budget.</p>
+        ) : (
+          <p className="text-xs text-gray-500">Only add sources that permit automated collection: an employer's own careers page or job board, an authorised API or feed, or a licensed provider. LinkedIn URLs are collected with the LinkedIn Actor (bebity/linkedin-jobs-scraper): use a company page (linkedin.com/company/…) to get that company's jobs, or a LinkedIn job-search URL. To search by job title and location instead, choose "{options.search_type}". Naukri and similar portals can't be added without a licence.</p>
+        )}
+        <Button title={search ? "Save search" : "Save source"} loading={busy} onClick={save} data-testid="src-save" />
       </div>
     </Modal>
+  );
+}
+
+function DemandCard({ ov, onSaved }) {
+  const [s, setS] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const pv = useQuery({ queryKey: ["apify-demand"], queryFn: () => api("/admin/apify/demand-preview") });
+  useEffect(() => setS({ ...ov.settings }), [ov.settings]);
+  if (!s) return null;
+  const set = (k) => (e) => setS((x) => ({ ...x, [k]: e?.target ? e.target.value : e }));
+  const save = async () => {
+    setBusy(true);
+    try {
+      await api("/admin/apify/settings", { method: "PUT", body: { ...s, demand_max_pairs: Number(s.demand_max_pairs),
+        demand_min_candidates: Number(s.demand_min_candidates), demand_jobs_per_pair: Number(s.demand_jobs_per_pair) } });
+      notify(s.demand_search_enabled ? "Demand search on — it runs with the daily collection" : "Demand search off", "success");
+      pv.refetch();
+      onSaved();
+    } catch (e) {
+      notify(errMsg(e), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const p = pv.data;
+  return (
+    <Card className="space-y-4" data-testid="demand-card">
+      <div><p className="h-sec">Candidate demand search</p>
+        <p className="text-xs text-gray-500">Searches LinkedIn every day for the job titles and cities your candidates want most (from their profile preferences). Only titles and cities are sent — never candidate details.</p></div>
+      <label className="flex items-center justify-between rounded-xl bg-brand-mist p-4 text-sm font-semibold">Search for what candidates want
+        <Switch checked={!!s.demand_search_enabled} onChange={set("demand_search_enabled")} data-testid="demand-enabled" /></label>
+      <div className="grid gap-3 md:grid-cols-3">
+        <Input label="Max searches (title × city)" inputMode="numeric" value={String(s.demand_max_pairs)} onChange={set("demand_max_pairs")} data-testid="demand-max" />
+        <Input label="Min candidates per search" inputMode="numeric" value={String(s.demand_min_candidates)} onChange={set("demand_min_candidates")} data-testid="demand-min" />
+        <Input label="Jobs per search" inputMode="numeric" value={String(s.demand_jobs_per_pair)} onChange={set("demand_jobs_per_pair")} />
+      </div>
+      {!p ? <Spinner /> : !p.pairs.length ? (
+        <p className="rounded-xl bg-gray-50 p-3 text-sm text-gray-500" data-testid="demand-empty">No title × city pair has {s.demand_min_candidates}+ candidates yet ({p.candidates_considered} candidate{p.candidates_considered === 1 ? "" : "s"} checked). Lower "Min candidates per search" or wait for more profiles.</p>
+      ) : (
+        <div data-testid="demand-preview">
+          <p className="mb-2 text-xs text-gray-500">Next run: {p.pairs.length} search{p.pairs.length === 1 ? "" : "es"} × up to {p.jobs_per_pair} jobs = at most {p.max_jobs_per_run} jobs, about {usd(p.max_cost_per_run_usd)} a day ({usd(p.max_cost_per_month_usd)} a month at most).</p>
+          <div className="max-h-64 overflow-y-auto rounded-xl border border-gray-100">
+            <table className="w-full"><thead className="bg-gray-50/60"><tr><Th>Job title</Th><Th>City</Th><Th>Candidates</Th></tr></thead>
+              <tbody className="divide-y divide-gray-100">{p.pairs.map((r) => <tr key={`${r.title}|${r.city}`}><Td>{r.title}</Td><Td>{r.city}</Td><Td>{r.candidates}</Td></tr>)}</tbody></table>
+          </div>
+        </div>
+      )}
+      <Button title="Save demand search" loading={busy} onClick={save} data-testid="demand-save" />
+    </Card>
   );
 }
 
@@ -116,49 +197,6 @@ function SettingsCard({ ov, onSaved }) {
   );
 }
 
-const EMPTY_LI = { title: "", experience_years: "", locations: "", max_items: "50", category: "" };
-
-function LinkedInSearchCard({ defaults, onDone }) {
-  const [f, setF] = useState(EMPTY_LI);
-  const [busy, setBusy] = useState(false);
-  const set = (k) => (e) => setF((x) => ({ ...x, [k]: e?.target ? e.target.value : e }));
-  const max = Number(f.max_items) || 0;
-  const search = async () => {
-    setBusy(true);
-    try {
-      const res = await api("/admin/apify/linkedin-search", { method: "POST", body: {
-        title: f.title, experience_years: f.experience_years === "" ? null : Number(f.experience_years),
-        locations: toList(f.locations), max_items: max, category: f.category || null } });
-      notify(`LinkedIn search started (${res.source.name}). Jobs appear under Imports when it finishes.`, "success");
-      setF(EMPTY_LI);
-      onDone();
-    } catch (e) {
-      notify(errMsg(e), "error");
-    } finally {
-      setBusy(false);
-    }
-  };
-  return (
-    <Card className="mb-6 space-y-4" data-testid="linkedin-search">
-      <div>
-        <p className="h-sec">Search LinkedIn now</p>
-        <p className="muted text-sm">Runs bebity/linkedin-jobs-scraper right away. Experience narrows LinkedIn's seniority level; jobs whose description states a range that doesn't fit are flagged in review.</p>
-      </div>
-      <div className="grid gap-3 md:grid-cols-5">
-        <Input className="md:col-span-2" label="Job title" placeholder="e.g. Software Engineer" value={f.title} onChange={set("title")} data-testid="li-title" />
-        <Input label="Experience (years)" type="number" min="0" max="40" placeholder="Any" value={f.experience_years} onChange={set("experience_years")} data-testid="li-exp" />
-        <Input label="Locations" placeholder={defaults.join(", ") || "e.g. Bengaluru"} value={f.locations} onChange={set("locations")} data-testid="li-locations" />
-        <Input label="Max jobs" type="number" min="1" max="1000" value={f.max_items} onChange={set("max_items")} data-testid="li-max" />
-      </div>
-      <div className="flex flex-wrap items-end gap-3">
-        <Field label="Job category for imports"><select className="field" value={f.category} onChange={set("category")}><option value="">Set during review</option>{CATEGORIES.map((o) => <option key={o}>{o}</option>)}</select></Field>
-        <Button title="Run search" loading={busy} disabled={f.title.trim().length < 2 || max < 1} onClick={search} data-testid="li-run" />
-        <span className="text-xs text-gray-500">About ${(max * 0.0015).toFixed(2)} for {max} jobs</span>
-      </div>
-    </Card>
-  );
-}
-
 export function AdminJobSources() {
   const ov = useQuery({ queryKey: ["apify-overview"], queryFn: () => api("/admin/apify/overview") });
   const srcQ = useQuery({ queryKey: ["job-sources"], queryFn: () => api("/admin/sources") });
@@ -194,6 +232,7 @@ export function AdminJobSources() {
       <PageHeader title="Job Sources (Apify)" subtitle="Approved sources JobRadar collects jobs from"
         right={<div className="flex gap-2">
           <Button variant="outline" title="Run all now" loading={running} onClick={() => run([])} data-testid="sources-run-all" />
+          <Button variant="outline" title="Add a job search" onClick={() => setEdit({ ...EMPTY_SRC, source_type: d.options.search_type, permission_status: "Approved", enabled: true })} data-testid="sources-add-search" />
           <Button title="Add source" onClick={() => setEdit({ ...EMPTY_SRC })} data-testid="sources-add" />
         </div>} />
       <div className="mb-6 grid grid-cols-2 gap-4 md:grid-cols-5" data-testid="apify-stats">
@@ -206,22 +245,24 @@ export function AdminJobSources() {
       {!d.token_configured ? <p className="mb-4 rounded-xl bg-red-50 p-3 text-sm text-red-700" data-testid="apify-no-token">Apify isn't connected. Add APIFY_TOKEN to the server's secrets.</p> : null}
       {!d.settings.paid_runs_approved ? <p className="mb-4 rounded-xl bg-amber-50 p-3 text-sm text-amber-800">Paid runs aren't approved yet — nothing will be collected until you approve them in the settings below.</p> : null}
       {!d.webhook_configured ? <p className="mb-4 text-xs text-gray-500">Instant import after each run is off (set APIFY_WEBHOOK_SECRET and PUBLIC_BACKEND_URL). Finished runs are still imported by the daily job or the Check button.</p> : null}
-      <LinkedInSearchCard defaults={d.settings.default_locations} onDone={reload} />
       <Card className="mb-6 overflow-x-auto p-0" data-testid="sources-table">
-        {!srcQ.data.sources.length ? <EmptyState title="No sources yet" subtitle="Add an employer's careers page or job board to start." /> : (
+        {!srcQ.data.sources.length ? <EmptyState title="No sources yet" subtitle="Add a job search (just titles and locations), or an employer's careers page or job board." /> : (
           <table className="w-full">
             <thead className="border-b border-gray-100 bg-gray-50/60"><tr><Th>Source</Th><Th>Permission</Th><Th>Frequency</Th><Th>Last checked / success</Th><Th>Jobs</Th><Th>Status</Th><Th /></tr></thead>
             <tbody className="divide-y divide-gray-100">
               {srcQ.data.sources.map((x) => (
                 <tr key={x.source_id} data-testid={`source-${x.source_id}`}>
-                  <Td><p className="font-bold">{x.name}</p><a href={x.url} target="_blank" rel="noreferrer" className="text-xs text-brand hover:underline">{x.url}</a><p className="text-xs text-gray-500">{x.source_type} · added {formatDate(x.date_added)}</p></Td>
+                  <Td><p className="font-bold">{x.name}</p>{x.url ? <a href={x.url} target="_blank" rel="noreferrer" className="text-xs text-brand hover:underline">{x.url}</a> : null}
+                    {x.source_type === d.options.search_type ? <p className="text-xs text-brand">Search: {toList(x.keywords).join(", ")} · in {toList(x.locations).join(", ")}{Object.values(x.filters || {}).flat().length ? ` · ${Object.values(x.filters).flat().join(", ")}` : ""}</p> : null}
+                    {x.managed ? <p className="text-xs text-brand">Automatic: {(x.demand_pairs || []).length} title × city searches from candidate preferences</p> : null}
+                    <p className="text-xs text-gray-500">{x.source_type} · added {formatDate(x.date_added)}</p></Td>
                   <Td><Badge label={x.permission_status} color={PERM_COLOR[x.permission_status]} />{x.permission_note ? <p className="mt-1 max-w-[14rem] text-xs text-gray-500">{x.permission_note}</p> : null}</Td>
                   <Td>{x.frequency}{x.category ? <p className="text-xs text-gray-500">{x.category}</p> : null}</Td>
                   <Td className="text-xs">{x.last_checked_at ? formatDate(x.last_checked_at) : "Never"}<br /><span className="text-gray-500">{x.last_success_at ? formatDate(x.last_success_at) : "—"}</span></Td>
                   <Td className="text-xs">{x.jobs_imported || 0} imported<br /><span className="text-gray-500">{x.jobs_awaiting} awaiting · {x.jobs_published} live</span></Td>
                   <Td>{x.enabled ? <Badge label="Enabled" color="success" /> : <Badge label="Off" />}{x.failed_attempts ? <p className="mt-1 text-xs text-red-600">{x.failed_attempts} failed: {x.last_error}</p> : null}</Td>
                   <Td><div className="flex gap-2">
-                    <Button size="sm" variant="outline" title="Edit" onClick={() => setEdit(x)} />
+                    {!x.managed ? <Button size="sm" variant="outline" title="Edit" onClick={() => setEdit(x)} /> : null}
                     {x.enabled ? <Button size="sm" variant="ghost" title="Run" onClick={() => run([x.source_id])} /> : null}
                   </div></Td>
                 </tr>
@@ -230,6 +271,7 @@ export function AdminJobSources() {
           </table>
         )}
       </Card>
+      <div className="mb-6"><DemandCard ov={d} onSaved={reload} /></div>
       <div className="grid gap-6 lg:grid-cols-2">
         <SettingsCard ov={d} onSaved={reload} />
         <Card className="space-y-3" data-testid="apify-runs">

@@ -18,7 +18,7 @@ import pytest
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from apify_jobs import norm_url, normalise  # noqa: E402
+from apify_jobs import demand_pairs, linkedin_filters, linkedin_search_url, norm_url, normalise  # noqa: E402
 
 BACKEND = os.environ.get("APIFY_TEST_BACKEND_URL")
 
@@ -116,16 +116,36 @@ def test_normalise_real_linkedin_item():
     assert normalise({**LINKEDIN_ITEM, "applyUrl": "https://acme.com/apply"})["application_link"] == "https://acme.com/apply"
 
 
-def test_linkedin_levels_and_experience_fit():
-    from apify_jobs import experience_fits, linkedin_levels
-    assert linkedin_levels(0) == ["1", "2"] and linkedin_levels(5) == ["3", "4"] and linkedin_levels(12) == ["4", "5"]
-    assert experience_fits(5, 3, 6) and experience_fits(5, None, None) and experience_fits(5, 6, None)
-    assert not experience_fits(5, 10, 15) and not experience_fits(5, 0, 2)
-
-
 def test_norm_url_linkedin_canonical():
     assert norm_url("https://www.linkedin.com/jobs/view/4485302230/?refId=a&trackingId=b") == \
         "https://www.linkedin.com/jobs/view/4485302230"
+
+
+def test_demand_pairs_counts_and_caps():
+    cands = [
+        {"preferred_titles": ["Data Analyst", "Any"], "preferred_locations": ["Pune", "Anywhere"]},
+        {"preferred_designation": "data  analyst", "preferred_location": "pune"},  # same pair, other spelling
+        {"preferred_titles": "Data Analyst; Travel Consultant", "preferred_locations": "Pune, Mumbai"},
+        {"preferred_titles": ["Data Analyst"], "preferred_locations": ["Pune"], "suspended": True},  # ignored
+        {"preferred_titles": ["Data Analyst"], "preferred_locations": ["Pune"], "role": "admin"},  # ignored
+        {"preferred_titles": ["Travel Consultant"], "preferred_locations": ["Mumbai"]},
+        {"preferred_titles": ["Data Analyst"]},  # no city: no pair
+    ]
+    rows = demand_pairs(cands, max_pairs=20, min_candidates=2)
+    assert rows == [{"title": "Data Analyst", "city": "Pune", "candidates": 3},
+                    {"title": "Travel Consultant", "city": "Mumbai", "candidates": 2}]
+    assert demand_pairs(cands, max_pairs=1, min_candidates=1) == rows[:1]
+    assert len(demand_pairs(cands, max_pairs=20, min_candidates=1)) == 4  # + Data Analyst·Mumbai, Travel Consultant·Pune
+    assert all(set(r) == {"title", "city", "candidates"} for r in rows), "nothing identifying a candidate"
+
+
+def test_linkedin_search_url_and_filters():
+    assert linkedin_search_url("UI/UX Designer", "Navi Mumbai", 7) == \
+        "https://www.linkedin.com/jobs/search?keywords=UI%2FUX+Designer&location=Navi+Mumbai&f_TPR=r604800"
+    assert linkedin_search_url("x", "y", 30).endswith("f_TPR=r2592000")
+    assert linkedin_filters({"experience": ["Entry level", "Director"], "work_mode": ["Remote"], "employment": ["Internship"],
+                             "bogus": ["x"]}) == {"experienceLevels": ["2", "5"], "workTypes": ["2"], "contractTypes": ["I"]}
+    assert linkedin_filters({}) == {}
 
 
 # --------------------------------------------------------------------------- fake Apify API
@@ -191,6 +211,10 @@ class TestApifyFlow:
         cls.db.job_sources.delete_many({"source_id": {"$in": srcs}})
         cls.db.apify_runs.delete_many({"source_ids": {"$in": srcs}})
         cls.db.job_import_logs.delete_many({"title": {"$regex": "^TEST_APIFY"}})
+        cls.db.users.delete_many({"email": {"$regex": "^test_apify_"}})
+        cls.db.apify_runs.delete_many({"source_ids": "src_demand"})
+        cls.db.job_sources.delete_many({"source_id": "src_demand"})
+        cls.db.jobs.delete_many({"source_id": "src_demand"})
 
     @classmethod
     def teardown_class(cls):
@@ -346,46 +370,65 @@ class TestApifyFlow:
         job = self.db.jobs.find_one({"source_id": src["source_id"]})
         assert job["original_url"] == "https://www.linkedin.com/jobs/view/4477826957" and job["region"] == "India"
 
-    def test_admin_linkedin_search_by_title_and_experience(self):
+    def test_job_search_needs_no_url(self):
         api, h = self.api, self.h
-        self.settings(default_locations=["Bengaluru"])
-        body = {"title": "TEST_APIFY Software Engineer", "experience_years": 5, "max_items": 30}
-        self.settings(default_locations=["Bengaluru"], paid_runs_approved=False)
-        assert requests.post(f"{api}/admin/apify/linkedin-search", headers=h, json=body).status_code == 409
-        assert not self.db.job_sources.find_one({"name": {"$regex": "TEST_APIFY Software Engineer"}}), "nothing saved when it can't run"
-        self.settings(default_locations=["Bengaluru"])
-        Fake.started.clear()
-        r = requests.post(f"{api}/admin/apify/linkedin-search", headers=h, json=body)
+        self.settings(posted_within_days=7, max_items_per_run=60)
+        base = {"name": "TEST_APIFY Search Travel", "source_type": "Job search (LinkedIn)", "permission_status": "Approved",
+                "enabled": True}
+        assert requests.post(f"{api}/admin/sources", headers=h, json={**base, "keywords": ["Travel Consultant"]}).status_code == 400
+        assert requests.post(f"{api}/admin/sources", headers=h, json={**base, "keywords": ["x"], "locations": ["y"],
+                                                                      "filters": {"work_mode": ["Moon"]}}).status_code == 400
+        body = {**base, "keywords": ["Travel Consultant", "Ticketing Executive"], "locations": ["Mumbai"],
+                "filters": {"experience": ["Entry level", "Associate"], "work_mode": ["Hybrid"]}}
+        r = requests.post(f"{api}/admin/sources", headers=h, json=body)
         assert r.status_code == 200, r.text
-        src, run = r.json()["source"], r.json()["runs"][0]
+        src = r.json()["source"]
+        assert src["url"] == "" and src["actor_id"] == "bebity/linkedin-jobs-scraper"
+        assert requests.post(f"{api}/admin/sources", headers=h, json=body).status_code == 400, "same search twice"
+        li = {**LINKEDIN_ITEM, "companyName": "TEST_APIFY Skyways", "title": "TEST_APIFY Travel Consultant",
+              "jobUrl": "https://in.linkedin.com/jobs/view/travel-consultant-4400000001", "location": "Mumbai, Maharashtra, India"}
+        doc = self.run_and_import(src["source_id"], [li], 1)
         inp = Fake.started[-1]["input"]
         assert Fake.started[-1]["actor"] == "bebity~linkedin-jobs-scraper"
-        assert inp["titles"] == ["TEST_APIFY Software Engineer"] and inp["locations"] == ["Bengaluru"]
-        assert inp["experienceLevels"] == ["3", "4"] and inp["rows"] == 30
-        assert src["frequency"] == "manual" and src["name"].startswith("LinkedIn: TEST_APIFY Software Engineer, 5 yrs")
-        # Import: a 4-7 year job fits, a 10-15 year job is flagged.
-        senior = ZETA_DESC.replace("2-8 years", "10-15 years")
-        Fake.items = [{**LINKEDIN_ITEM, "id": "4400000002", "jobUrl": "https://in.linkedin.com/jobs/view/sde-4400000002", "title": "TEST_APIFY SDE II", "companyName": "TEST_APIFY Li", "description": ZETA_DESC.replace("2-8", "4-7")},
-                      {**LINKEDIN_ITEM, "id": "4400000001", "jobUrl": "https://in.linkedin.com/jobs/view/staff-4400000001",
-                       "title": "TEST_APIFY Staff Engineer", "companyName": "TEST_APIFY Li", "description": senior}]
-        Fake.events, Fake.status = 2, "SUCCEEDED"
-        requests.post(f"{api}/apify/webhook", json={"resource": {"id": run["apify_run_id"]}}, headers={"X-JobRadar-Webhook": "hook-secret"})
-        for _ in range(40):
-            doc = self.db.apify_runs.find_one({"run_id": run["run_id"]})
-            if doc.get("processed"):
-                break
-            time.sleep(0.25)
-        assert doc["summary"]["created"] == 2
-        flags = {j["title"]: j["flags"] for j in self.db.jobs.find({"source_id": src["source_id"]})}
-        assert "experience_mismatch" not in flags["TEST_APIFY SDE II"]
-        assert "experience_mismatch" in flags["TEST_APIFY Staff Engineer"]
-        # The same search again within 15 minutes is refused; bad input is rejected.
-        assert requests.post(f"{api}/admin/apify/linkedin-search", headers=h, json=body).status_code == 409
-        assert requests.post(f"{api}/admin/apify/linkedin-search", headers=h, json={**body, "experience_years": 99}).status_code == 400
-        assert requests.post(f"{api}/admin/apify/linkedin-search", headers=h, json={**body, "title": " "}).status_code == 400
-        self.db.job_sources.delete_one({"source_id": src["source_id"]})
-        self.db.jobs.delete_many({"source_id": src["source_id"]})
-        self.db.apify_runs.delete_many({"source_ids": src["source_id"]})
+        assert inp["titles"] == ["Travel Consultant", "Ticketing Executive"] and inp["locations"] == ["Mumbai"]
+        assert sorted(inp["experienceLevels"]) == ["2", "3"]
+        assert inp["workTypes"] == ["3"] and inp["rows"] == 30 and inp["publishedAt"] == "r604800"
+        assert doc["summary"]["created"] == 1
+        job = self.db.jobs.find_one({"source_id": src["source_id"]})
+        assert job["review_status"] == "new_import" and job["status"] == "Draft" and job["region"] == "India"
+
+    def test_candidate_demand_search(self):
+        api, h = self.api, self.h
+        for i, (title, city) in enumerate([("TEST_APIFY Pilot", "Testpur"), ("TEST_APIFY Pilot", "Testpur"),
+                                           ("test_apify pilot", "TESTPUR"), ("TEST_APIFY Cabin Crew", "Testpur")]):
+            self.db.users.insert_one({"user_id": f"user_testapify{i}", "email": f"test_apify_{i}@example.com", "role": "candidate",
+                                      "full_name": f"Secret Name {i}", "preferred_titles": [title], "preferred_locations": [city],
+                                      "suspended": False})
+        self.settings(demand_search_enabled=False, demand_min_candidates=3, demand_max_pairs=20, demand_jobs_per_pair=5)
+        pv = requests.get(f"{api}/admin/apify/demand-preview", headers=h).json()
+        mine = [p for p in pv["pairs"] if p["title"].lower().startswith("test_apify")]
+        assert mine == [{"title": "TEST_APIFY Pilot", "city": "Testpur", "candidates": 3}], pv
+        assert not (self.db.job_sources.find_one({"source_id": "src_demand"}) or {}).get("enabled")
+
+        self.settings(demand_search_enabled=True, demand_min_candidates=3, demand_max_pairs=20, demand_jobs_per_pair=5)
+        row = self.db.job_sources.find_one({"source_id": "src_demand"})
+        assert row["enabled"] and row["managed"] and row["source_type"] == "Candidate demand search"
+        url = "https://www.linkedin.com/jobs/search?keywords=TEST_APIFY+Pilot&location=Testpur&f_TPR=r2592000"
+        assert url in row["actor_input"]["startUrls"]
+        assert requests.put(f"{api}/admin/sources/src_demand", headers=h, json={
+            "name": "x", "url": "https://jobs.lever.co/x", "permission_status": "Approved"}).status_code == 400
+        li = {**LINKEDIN_ITEM, "companyName": "TEST_APIFY Airways", "title": "TEST_APIFY Pilot",
+              "jobUrl": "https://www.linkedin.com/jobs/view/4400000002", "location": "Testpur, India"}
+        doc = self.run_and_import("src_demand", [li], 1)
+        started = Fake.started[-1]
+        assert started["actor"] == "bebity~linkedin-jobs-scraper" and url in started["input"]["startUrls"]
+        assert started["input"]["maxRowsPerUrl"] == 5 and started["input"]["enrichCompany"] is False
+        assert "Secret Name" not in json.dumps(started["input"]) and "example.com" not in json.dumps(started["input"])
+        assert doc["summary"]["created"] == 1
+        assert self.db.jobs.find_one({"source_id": "src_demand"})["review_status"] == "new_import"
+
+        self.settings(demand_search_enabled=False)
+        assert self.db.job_sources.find_one({"source_id": "src_demand"})["enabled"] is False
 
     def test_cron_once_per_day(self):
         secret = os.environ.get("WEBHOOK_CRON_SECRET", "local-dev-cron-secret")

@@ -16,7 +16,7 @@ import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import httpx
 from ops import tracked
@@ -25,6 +25,7 @@ from pydantic import BaseModel
 from pymongo import ReturnDocument, UpdateOne
 
 from resume_parse import SKILLS
+from smartmatch import candidate_lists
 
 logger = logging.getLogger("jobradar.apify")
 
@@ -42,9 +43,23 @@ DEFAULT_SETTINGS = {
     "actor_id": DEFAULT_ACTOR, "default_keywords": [], "default_locations": ["India"], "max_items_per_run": 200,
     "max_items_per_company": 25, "posted_within_days": 30, "monthly_budget_usd": 15.0, "per_run_cap_usd": 2.0,
     "paid_runs_approved": False, "auto_daily": True,
+    "demand_search_enabled": False, "demand_max_pairs": 20, "demand_min_candidates": 2, "demand_jobs_per_pair": 10,
 }
-SOURCE_TYPES = ["Employer career page", "Company recruitment page", "Authorised job API", "Permitted RSS feed",
+# A job search is a source with no URL: the LinkedIn Actor finds jobs matching its titles, locations and filters.
+SEARCH_TYPE = "Job search (LinkedIn)"
+# The candidate-demand search is a single system-managed source rebuilt daily from candidates' preferences.
+DEMAND_TYPE = "Candidate demand search"
+DEMAND_ID = "src_demand"
+SOURCE_TYPES = [SEARCH_TYPE, "Employer career page", "Company recruitment page", "Authorised job API", "Permitted RSS feed",
                 "Licensed job data provider", "Other permitted website"]
+# JobRadar filter values → LinkedIn Actor input field and codes.
+LI_FILTERS = {
+    "experience": ("experienceLevels", {"Internship": "1", "Entry level": "2", "Associate": "3", "Mid-Senior level": "4",
+                                        "Director": "5"}),
+    "work_mode": ("workTypes", {"Work From Office": "1", "Remote": "2", "Hybrid": "3"}),
+    "employment": ("contractTypes", {"Full-time": "F", "Part-time": "P", "Contract": "C", "Internship": "I"}),
+}
+NO_PREFERENCE = {"any", "anywhere", "all", "open", "na", "n/a", "none", "-", "not sure", "flexible"}
 PERMISSION = ["Approved", "Pending review", "Not permitted"]
 FREQUENCY = {"daily": 20, "weekly": 6.5 * 24, "manual": None}  # hours between automatic runs
 REVIEW = ["new_import", "pending_review", "approved", "rejected", "archived"]
@@ -151,29 +166,6 @@ INDIA_CITIES = re.compile(r"\b(bangalore|bengaluru|mumbai|delhi|new delhi|gurgao
                           r"navi mumbai|thane|mysore|mysuru|vadodara|lucknow|bhubaneswar|nagpur|surat|visakhapatnam)\b", re.I)
 
 
-def linkedin_levels(years: int) -> List[str]:
-    """LinkedIn seniority filter for a number of years of experience. Levels overlap at the edges on purpose:
-    LinkedIn's levels are coarse, and the import flags jobs whose stated experience doesn't fit."""
-    if years < 1:
-        return ["1", "2"]          # Internship, Entry level
-    if years <= 2:
-        return ["2", "3"]          # Entry level, Associate
-    if years <= 5:
-        return ["3", "4"]          # Associate, Mid-Senior level
-    if years <= 9:
-        return ["4"]               # Mid-Senior level
-    return ["4", "5"]              # Mid-Senior level, Director
-
-
-def experience_fits(years: int, lo: Optional[float], hi: Optional[float]) -> bool:
-    """True unless the job states an experience range that clearly excludes `years` (a year of slack each way)."""
-    if lo is not None and years < lo - 1:
-        return False
-    if hi is not None and years > hi + 1:
-        return False
-    return True
-
-
 def _country(item: dict, location: str) -> str:
     raw = _first(item, "countries", "countries_derived", "country")
     name = str(raw or "").strip()
@@ -231,11 +223,53 @@ def normalise(item: dict) -> dict:
     return out
 
 
+def _posted_code(days: int) -> str:
+    return "r86400" if days <= 1 else "r604800" if days <= 7 else "r2592000"
+
+
+def linkedin_search_url(title: str, city: str, days: int = 7) -> str:
+    """One exact LinkedIn search (title in one city), so pairs aren't crossed with every other title and city."""
+    return "https://www.linkedin.com/jobs/search?" + urlencode({"keywords": title, "location": city, "f_TPR": _posted_code(days)})
+
+
+def demand_pairs(candidates: List[dict], max_pairs: int = 20, min_candidates: int = 2) -> List[dict]:
+    """The most-wanted (job title, city) pairs across active candidates. Only titles, cities and counts come out:
+    nothing identifying a candidate is sent to Apify."""
+    counts: Dict[tuple, int] = {}
+    label: Dict[tuple, tuple] = {}
+    for c in candidates:
+        if c.get("suspended") or c.get("role", "candidate") != "candidate":
+            continue
+        titles, cities = candidate_lists(c)
+        seen = set()
+        for t in titles:
+            for city in cities:
+                key = (" ".join(t.lower().split()), " ".join(city.lower().split()))
+                if key in seen or len(key[0]) < 2 or len(key[1]) < 2 or key[0] in NO_PREFERENCE or key[1] in NO_PREFERENCE:
+                    continue
+                seen.add(key)
+                counts[key] = counts.get(key, 0) + 1
+                label.setdefault(key, (" ".join(t.split())[:80], " ".join(city.split())[:60]))
+    rows = [{"title": label[k][0], "city": label[k][1], "candidates": n} for k, n in counts.items() if n >= min_candidates]
+    rows.sort(key=lambda r: (-r["candidates"], r["title"].lower(), r["city"].lower()))
+    return rows[:max_pairs]
+
+
+def linkedin_filters(filters: Optional[dict]) -> dict:
+    out = {}
+    for k, (field, codes) in LI_FILTERS.items():
+        vals = [codes[v] for v in (filters or {}).get(k) or [] if v in codes]
+        if vals:
+            out[field] = vals
+    return out
+
+
 # --------------------------------------------------------------------------- API models
 class SourceReq(BaseModel):
     name: str
-    url: str
+    url: str = ""
     source_type: str = "Employer career page"
+    filters: Dict[str, List[str]] = {}
     permission_status: str = "Pending review"
     permission_note: str = ""
     enabled: bool = False
@@ -245,16 +279,6 @@ class SourceReq(BaseModel):
     locations: List[str] = []
     actor_id: Optional[str] = None
     actor_input: Optional[Dict[str, Any]] = None
-    experience_years: Optional[int] = None  # LinkedIn only: narrows the search to matching seniority levels
-    max_items: Optional[int] = None  # per-source cap; defaults to the global max items per run
-
-
-class LinkedInSearchReq(BaseModel):
-    title: str
-    experience_years: Optional[int] = None
-    locations: List[str] = []
-    max_items: int = 50
-    category: Optional[str] = None
 
 
 class SettingsReq(BaseModel):
@@ -268,6 +292,10 @@ class SettingsReq(BaseModel):
     per_run_cap_usd: float = 2.0
     paid_runs_approved: bool = False
     auto_daily: bool = True
+    demand_search_enabled: bool = False
+    demand_max_pairs: int = 20
+    demand_min_candidates: int = 2
+    demand_jobs_per_pair: int = 10
 
 
 class RunReq(BaseModel):
@@ -320,15 +348,12 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
             companies = [x["url"] for x in srcs if re.search(r"linkedin\.com/company/", x["url"], re.I)]
             searches = [x["url"] for x in srcs if re.search(r"linkedin\.com/jobs/search", x["url"], re.I)]
             days = s["posted_within_days"]
-            limit = srcs[0].get("max_items") or s["max_items_per_run"]
             out = {"titles": keywords, "locations": locations, "companyUrls": companies,
-                   "rows": max(1, limit // max(1, len(keywords) * max(1, len(locations)))),
-                   "publishedAt": "r86400" if days <= 1 else "r604800" if days <= 7 else "r2592000",
-                   "companyProfile": False, "enrichCompany": False}  # enrichment is billed per job
-            if srcs[0].get("experience_years") is not None:
-                out["experienceLevels"] = linkedin_levels(srcs[0]["experience_years"])
+                   "rows": max(1, s["max_items_per_run"] // max(1, len(keywords) * max(1, len(locations)))),
+                   "publishedAt": _posted_code(days), "companyProfile": False, "enrichCompany": False,  # enrichment is billed per job
+                   **linkedin_filters(srcs[0].get("filters"))}
             if searches:
-                out.update(startUrls=searches, maxRowsPerUrl=max(1, limit // len(searches)))
+                out.update(startUrls=searches, maxRowsPerUrl=max(1, s["max_items_per_run"] // len(searches)))
             return out
         if actor_id == "fantastic-jobs/career-site-job-listing-api":
             return {"organizationSearch": [x["name"] for x in srcs], "titleSearch": keywords, "locationSearch": locations,
@@ -340,6 +365,8 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
 
     def source_actor(x: dict, s: dict) -> str:
         """A source's own Actor; LinkedIn URLs always use the LinkedIn Actor, and other URLs never do."""
+        if x.get("source_type") in (SEARCH_TYPE, DEMAND_TYPE):
+            return LINKEDIN_ACTOR
         if x.get("actor_id"):
             return x["actor_id"]
         if LINKEDIN_URL.match(x.get("url") or ""):
@@ -353,7 +380,7 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
             actor = source_actor(x, s)
             key = (actor, tuple(sorted(x.get("keywords") or s["default_keywords"])),
                    tuple(sorted(x.get("locations") or s["default_locations"])), x["source_id"] if x.get("actor_input") else "",
-                   x.get("experience_years"), x.get("max_items"))
+                   tuple(sorted((k, tuple(sorted(v))) for k, v in (x.get("filters") or {}).items())))
             out.setdefault(key, []).append(x)
         return list(out.values())
 
@@ -421,10 +448,9 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
             summary = {"items": 0, "created": 0, "updated": 0, "changed_at_source": 0, "closed": 0, "duplicates": 0, "flagged": 0, "skipped": 0}
             if status == "SUCCEEDED" or doc.get("dataset_id"):
                 s = await settings()
-                srcs = await db.job_sources.find({"source_id": {"$in": doc["source_ids"]}}, {"_id": 0}).to_list(None)
-                limit = max([s["max_items_per_run"]] + [x.get("max_items") or 0 for x in srcs])
                 items = await apify("GET", f"/datasets/{doc['dataset_id']}/items",
-                                    params={"clean": "true", "limit": limit + 50, "format": "json"})
+                                    params={"clean": "true", "limit": s["max_items_per_run"] + 50, "format": "json"})
+                srcs = await db.job_sources.find({"source_id": {"$in": doc["source_ids"]}}, {"_id": 0}).to_list(None)
                 summary = await import_items(items if isinstance(items, list) else [], srcs, run_id)
             ok = status == "SUCCEEDED"
             await db.apify_runs.update_one({"run_id": run_id}, {"$set": {
@@ -513,8 +539,6 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
                 summary["skipped"] += 1
                 continue
             flags = list(n["flags"])
-            if src.get("experience_years") is not None and not experience_fits(src["experience_years"], n["experience_min"], n["experience_max"]):
-                flags.append("experience_mismatch")
             dup = by_key.get(n["dedupe_key"])
             if dup:
                 flags.append("possible_duplicate")
@@ -546,6 +570,40 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
             await db.job_sources.update_one({"source_id": sid}, {"$inc": {"jobs_imported": n}})
         return summary
 
+    # ------------------------------------------------------------------ candidate demand search
+    async def demand_preview_data(s: Optional[dict] = None) -> dict:
+        s = s or await settings()
+        cands = await db.users.find({"role": "candidate", "suspended": {"$ne": True}}, {
+            "_id": 0, "role": 1, "suspended": 1, "preferred_titles": 1, "preferred_designation": 1,
+            "preferred_locations": 1, "preferred_location": 1}).to_list(50000)
+        pairs = demand_pairs(cands, s["demand_max_pairs"], s["demand_min_candidates"])
+        per = max(1, min(s["demand_jobs_per_pair"], s["max_items_per_run"] // max(1, len(pairs))))
+        jobs = per * len(pairs)
+        price = ACTOR_PRESETS[LINKEDIN_ACTOR]["price_per_item_usd"]
+        return {"pairs": pairs, "jobs_per_pair": per, "max_jobs_per_run": jobs,
+                "max_cost_per_run_usd": round(jobs * price, 3), "max_cost_per_month_usd": round(jobs * price * 30, 2),
+                "candidates_considered": len(cands)}
+
+    async def refresh_demand_source() -> Optional[dict]:
+        """Rebuild the system-managed demand search from current candidate preferences (or switch it off)."""
+        s = await settings()
+        if not s["demand_search_enabled"]:
+            await db.job_sources.update_one({"source_id": DEMAND_ID}, {"$set": {"enabled": False}})
+            return None
+        pv = await demand_preview_data(s)
+        pairs = pv["pairs"]
+        actor_in = {"startUrls": [linkedin_search_url(p["title"], p["city"], s["posted_within_days"]) for p in pairs],
+                    "maxRowsPerUrl": pv["jobs_per_pair"], "companyProfile": False, "enrichCompany": False}
+        await db.job_sources.update_one({"source_id": DEMAND_ID}, {"$set": {
+            "name": "Candidate demand (automatic)", "url": "", "source_type": DEMAND_TYPE, "managed": True,
+            "permission_status": "Approved", "permission_note": "Rebuilt daily from candidates' preferred job titles and cities",
+            "enabled": bool(pairs), "frequency": "daily", "actor_id": LINKEDIN_ACTOR, "actor_input": actor_in,
+            "demand_pairs": pairs, "keywords": [], "locations": [], "filters": {}, "demand_refreshed_at": now_iso()},
+            "$setOnInsert": {"source_id": DEMAND_ID, "date_added": now_iso(), "added_by": "system", "category": None,
+                             "last_checked_at": None, "last_success_at": None, "jobs_imported": 0, "failed_attempts": 0,
+                             "last_error": None}}, upsert=True)
+        return pv
+
     # ------------------------------------------------------------------ scheduling
     async def due_sources() -> List[dict]:
         out = []
@@ -568,6 +626,7 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
         s = await settings()
         if not s["auto_daily"] or not s["paid_runs_approved"] or not token():
             return
+        await refresh_demand_source()
         srcs = await due_sources()
         if srcs:
             try:
@@ -631,10 +690,27 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
 
     def validate_source(req: SourceReq) -> dict:
         d = req.dict()
-        if not d["name"].strip() or not d["url"].strip():
-            raise HTTPException(400, "Name and URL are required")
-        if not re.match(r"^https?://", d["url"].strip()):
-            raise HTTPException(400, "Source URL must start with http:// or https://")
+        search = d["source_type"] == SEARCH_TYPE
+        if not d["name"].strip():
+            raise HTTPException(400, "Name is required")
+        if search:
+            # No URL: the LinkedIn Actor searches for these titles in these locations.
+            d.update(url="", actor_id=LINKEDIN_ACTOR, actor_input=None)
+            if not clean_list(d["keywords"]) or not clean_list(d["locations"]):
+                raise HTTPException(400, "A job search needs at least one job title and one location")
+            filters = {}
+            for k, vals in (d.get("filters") or {}).items():
+                if k not in LI_FILTERS or any(v not in LI_FILTERS[k][1] for v in vals):
+                    raise HTTPException(400, f"Unknown search filter: {k}")
+                if vals:
+                    filters[k] = sorted(set(vals))
+            d["filters"] = filters
+        else:
+            d["filters"] = {}
+            if not d["url"].strip():
+                raise HTTPException(400, "Source URL is required")
+            if not re.match(r"^https?://", d["url"].strip()):
+                raise HTTPException(400, "Source URL must start with http:// or https://")
         if d["source_type"] not in SOURCE_TYPES:
             raise HTTPException(400, "Invalid source type")
         if d["permission_status"] not in PERMISSION:
@@ -643,7 +719,9 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
             raise HTTPException(400, "Frequency must be daily, weekly or manual")
         if d["enabled"] and d["permission_status"] != "Approved":
             raise HTTPException(400, "Only sources with permission status Approved can be enabled")
-        if LINKEDIN_URL.match(d["url"].strip()):
+        if search:
+            pass
+        elif LINKEDIN_URL.match(d["url"].strip()):
             # LinkedIn URLs are collected with the LinkedIn Actor, whatever the global default Actor is.
             if d["actor_id"] and d["actor_id"] != LINKEDIN_ACTOR and not d["actor_input"]:
                 raise HTTPException(400, f"LinkedIn sources are collected with {LINKEDIN_ACTOR}")
@@ -656,10 +734,6 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
                                      "Add the employer's own careers page instead.")
         d.update(name=d["name"].strip()[:120], url=d["url"].strip()[:500], keywords=clean_list(d["keywords"]),
                  locations=clean_list(d["locations"]), permission_note=d["permission_note"][:500])
-        if d["experience_years"] is not None and not 0 <= d["experience_years"] <= 40:
-            raise HTTPException(400, "Experience must be 0–40 years")
-        if d["max_items"] is not None and not 1 <= d["max_items"] <= 1000:
-            raise HTTPException(400, "Max jobs must be 1–1000")
         return d
 
     @r.get("/admin/apify/overview")
@@ -684,7 +758,9 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
                 "webhook_configured": bool(os.environ.get("APIFY_WEBHOOK_SECRET") and os.environ.get("PUBLIC_BACKEND_URL")),
                 "month_spend_usd": await month_spend(), "apify_usage": apify_usage, "runs": runs,
                 "totals": {k: v for k, v in totals.items() if k != "_id"},
-                "options": {"source_types": SOURCE_TYPES, "permission": PERMISSION, "frequency": list(FREQUENCY)}}
+                "options": {"source_types": SOURCE_TYPES, "permission": PERMISSION, "frequency": list(FREQUENCY),
+                            "search_type": SEARCH_TYPE, "demand_type": DEMAND_TYPE,
+                            "filters": {k: list(codes) for k, (_, codes) in LI_FILTERS.items()}}}
 
     @r.put("/admin/apify/settings")
     async def put_settings(req: SettingsReq, admin=Depends(require_admin)):
@@ -695,51 +771,18 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
             raise HTTPException(400, "Max items per run must be 1–1000 and per company 1–200")
         if not 0 <= d["monthly_budget_usd"] <= 500 or not 0.1 <= d["per_run_cap_usd"] <= 50:
             raise HTTPException(400, "Budget must be $0–500 a month and per-run cap $0.10–50")
+        if not 1 <= d["demand_max_pairs"] <= 100 or not 1 <= d["demand_min_candidates"] <= 50 \
+                or not 1 <= d["demand_jobs_per_pair"] <= 50:
+            raise HTTPException(400, "Demand search: 1–100 searches, 1–50 candidates per search and 1–50 jobs per search")
         d["default_keywords"], d["default_locations"] = clean_list(d["default_keywords"]), clean_list(d["default_locations"])
         await db.app_settings.update_one({"key": "apify"}, {"$set": {"key": "apify", **d}}, upsert=True)
         await audit_log(admin, "update_apify_settings", "settings", "apify", d)
+        await refresh_demand_source()
         return d
 
-    @r.post("/admin/apify/linkedin-search")
-    async def linkedin_search(req: LinkedInSearchReq, admin=Depends(require_admin)):
-        """Run a LinkedIn job search now, e.g. "Software Engineer", 5 years, Bengaluru. The search is saved as a manual
-        source so it can be re-run or switched to daily; its jobs land in the import review queue like any other."""
-        title = re.sub(r"\s+", " ", req.title or "").strip()[:80]
-        if len(title) < 2:
-            raise HTTPException(400, "Enter a job title to search for")
-        if req.experience_years is not None and not 0 <= req.experience_years <= 40:
-            raise HTTPException(400, "Experience must be 0–40 years")
-        if not 1 <= req.max_items <= 1000:
-            raise HTTPException(400, "Max jobs must be 1–1000")
-        s = await settings()
-        # Check before saving anything, so a search that can't run doesn't leave a source behind.
-        if not token():
-            raise HTTPException(503, "Apify isn't configured: set APIFY_TOKEN in the server's secrets.")
-        if not s["paid_runs_approved"]:
-            raise HTTPException(409, "Apify runs need admin approval first: approve paid runs and set a monthly budget in Apify settings.")
-        locs = clean_list(req.locations) or s["default_locations"]
-        key = hashlib.sha1(json.dumps([title.lower(), req.experience_years, sorted(x.lower() for x in locs)]).encode()).hexdigest()[:16]
-        src = await db.job_sources.find_one({"search_key": key}, {"_id": 0})
-        if src:
-            if src.get("last_checked_at") and src["last_checked_at"] > (now() - timedelta(minutes=15)).isoformat():
-                raise HTTPException(409, "This search ran in the last 15 minutes. Check its run below before running it again.")
-            await db.job_sources.update_one({"source_id": src["source_id"]}, {"$set": {
-                "max_items": req.max_items, "enabled": True, "category": req.category or src.get("category")}})
-            src.update(max_items=req.max_items, category=req.category or src.get("category"))
-        else:
-            label = title + (f", {req.experience_years} yrs" if req.experience_years is not None else "") + f" · {', '.join(locs)}"
-            src = {"source_id": f"src_{uuid.uuid4().hex[:10]}", "name": f"LinkedIn: {label}"[:120],
-                   "url": "https://www.linkedin.com/jobs", "source_type": "Other permitted website",
-                   "permission_status": "Approved", "permission_note": "Admin LinkedIn search", "enabled": True,
-                   "frequency": "manual", "category": req.category or None, "keywords": [title], "locations": locs,
-                   "actor_id": LINKEDIN_ACTOR, "actor_input": None, "experience_years": req.experience_years,
-                   "max_items": req.max_items, "search_key": key, "date_added": now_iso(), "added_by": admin.get("email"),
-                   "last_checked_at": None, "last_success_at": None, "jobs_imported": 0, "failed_attempts": 0, "last_error": None}
-            await db.job_sources.insert_one(dict(src))
-        started = await start_runs([src], "manual", admin)
-        await audit_log(admin, "run_linkedin_search", "job_source", src["source_id"],
-                        {"title": title, "experience_years": req.experience_years, "locations": locs, "runs": [x["run_id"] for x in started]})
-        return {"source": src, "runs": started}
+    @r.get("/admin/apify/demand-preview")
+    async def demand_preview(admin=Depends(require_admin)):
+        return await demand_preview_data()
 
     @r.get("/admin/sources")
     async def list_sources(admin=Depends(require_admin)):
@@ -756,8 +799,11 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
     @r.post("/admin/sources")
     async def add_source(req: SourceReq, admin=Depends(require_admin)):
         d = validate_source(req)
-        if await db.job_sources.find_one({"url": d["url"]}):
-            raise HTTPException(400, "This source has already been added")
+        same = {"source_type": SEARCH_TYPE, "keywords": d["keywords"], "locations": d["locations"], "filters": d["filters"]} \
+            if d["source_type"] == SEARCH_TYPE else {"url": d["url"]}
+        if await db.job_sources.find_one(same):
+            raise HTTPException(400, "This search has already been added" if d["source_type"] == SEARCH_TYPE
+                                else "This source has already been added")
         d.update(source_id=f"src_{uuid.uuid4().hex[:10]}", date_added=now_iso(), added_by=admin.get("email"),
                  last_checked_at=None, last_success_at=None, jobs_imported=0, failed_attempts=0, last_error=None)
         await db.job_sources.insert_one(dict(d))
@@ -767,6 +813,8 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
 
     @r.put("/admin/sources/{sid}")
     async def edit_source(sid: str, req: SourceReq, admin=Depends(require_admin)):
+        if sid == DEMAND_ID:
+            raise HTTPException(400, "The candidate demand search is managed from its settings card")
         d = validate_source(req)
         res = await db.job_sources.update_one({"source_id": sid}, {"$set": {**d, "updated_at": now_iso()}})
         if not res.matched_count:
@@ -776,6 +824,7 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
 
     @r.post("/admin/sources/run")
     async def run_now(req: RunReq, admin=Depends(require_admin)):
+        await refresh_demand_source()
         q: dict = {"enabled": True, "permission_status": "Approved"}
         if req.source_ids:
             q["source_id"] = {"$in": req.source_ids}
