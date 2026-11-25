@@ -11,7 +11,7 @@ const Td = ({ children, className = "" }) => <td className={`px-4 py-3.5 align-t
 const RUN_COLOR = { SUCCEEDED: "success", FAILED: "error", ABORTED: "error", "TIMED-OUT": "error", RUNNING: "warning", READY: "warning", STARTING: "warning" };
 const PERM_COLOR = { Approved: "success", "Pending review": "warning", "Not permitted": "error" };
 const FLAG_LABEL = { incomplete: "Incomplete", suspicious: "Suspicious", old_posting: "Old posting", possible_duplicate: "Possible duplicate",
-  closed_at_source: "Closed at source", source_changed: "Changed at source" };
+  closed_at_source: "Closed at source", source_changed: "Changed at source", experience_mismatch: "Experience doesn't fit search" };
 const REVIEW_TABS = [["new_import", "New imports"], ["pending_review", "Pending review"], ["approved", "Approved"], ["rejected", "Rejected"], ["archived", "Archived"], ["All", "All"]];
 const usd = (n) => `$${Number(n || 0).toFixed(n < 1 ? 3 : 2)}`;
 const toList = (s) => (Array.isArray(s) ? s : String(s || "").split(",").map((x) => x.trim()).filter(Boolean));
@@ -116,6 +116,49 @@ function SettingsCard({ ov, onSaved }) {
   );
 }
 
+const EMPTY_LI = { title: "", experience_years: "", locations: "", max_items: "50", category: "" };
+
+function LinkedInSearchCard({ defaults, onDone }) {
+  const [f, setF] = useState(EMPTY_LI);
+  const [busy, setBusy] = useState(false);
+  const set = (k) => (e) => setF((x) => ({ ...x, [k]: e?.target ? e.target.value : e }));
+  const max = Number(f.max_items) || 0;
+  const search = async () => {
+    setBusy(true);
+    try {
+      const res = await api("/admin/apify/linkedin-search", { method: "POST", body: {
+        title: f.title, experience_years: f.experience_years === "" ? null : Number(f.experience_years),
+        locations: toList(f.locations), max_items: max, category: f.category || null } });
+      notify(`LinkedIn search started (${res.source.name}). Jobs appear under Imports when it finishes.`, "success");
+      setF(EMPTY_LI);
+      onDone();
+    } catch (e) {
+      notify(errMsg(e), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Card className="mb-6 space-y-4" data-testid="linkedin-search">
+      <div>
+        <p className="h-sec">Search LinkedIn now</p>
+        <p className="muted text-sm">Runs bebity/linkedin-jobs-scraper right away. Experience narrows LinkedIn's seniority level; jobs whose description states a range that doesn't fit are flagged in review.</p>
+      </div>
+      <div className="grid gap-3 md:grid-cols-5">
+        <Input className="md:col-span-2" label="Job title" placeholder="e.g. Software Engineer" value={f.title} onChange={set("title")} data-testid="li-title" />
+        <Input label="Experience (years)" type="number" min="0" max="40" placeholder="Any" value={f.experience_years} onChange={set("experience_years")} data-testid="li-exp" />
+        <Input label="Locations" placeholder={defaults.join(", ") || "e.g. Bengaluru"} value={f.locations} onChange={set("locations")} data-testid="li-locations" />
+        <Input label="Max jobs" type="number" min="1" max="1000" value={f.max_items} onChange={set("max_items")} data-testid="li-max" />
+      </div>
+      <div className="flex flex-wrap items-end gap-3">
+        <Field label="Job category for imports"><select className="field" value={f.category} onChange={set("category")}><option value="">Set during review</option>{CATEGORIES.map((o) => <option key={o}>{o}</option>)}</select></Field>
+        <Button title="Run search" loading={busy} disabled={f.title.trim().length < 2 || max < 1} onClick={search} data-testid="li-run" />
+        <span className="text-xs text-gray-500">About ${(max * 0.0015).toFixed(2)} for {max} jobs</span>
+      </div>
+    </Card>
+  );
+}
+
 export function AdminJobSources() {
   const ov = useQuery({ queryKey: ["apify-overview"], queryFn: () => api("/admin/apify/overview") });
   const srcQ = useQuery({ queryKey: ["job-sources"], queryFn: () => api("/admin/sources") });
@@ -163,6 +206,7 @@ export function AdminJobSources() {
       {!d.token_configured ? <p className="mb-4 rounded-xl bg-red-50 p-3 text-sm text-red-700" data-testid="apify-no-token">Apify isn't connected. Add APIFY_TOKEN to the server's secrets.</p> : null}
       {!d.settings.paid_runs_approved ? <p className="mb-4 rounded-xl bg-amber-50 p-3 text-sm text-amber-800">Paid runs aren't approved yet — nothing will be collected until you approve them in the settings below.</p> : null}
       {!d.webhook_configured ? <p className="mb-4 text-xs text-gray-500">Instant import after each run is off (set APIFY_WEBHOOK_SECRET and PUBLIC_BACKEND_URL). Finished runs are still imported by the daily job or the Check button.</p> : null}
+      <LinkedInSearchCard defaults={d.settings.default_locations} onDone={reload} />
       <Card className="mb-6 overflow-x-auto p-0" data-testid="sources-table">
         {!srcQ.data.sources.length ? <EmptyState title="No sources yet" subtitle="Add an employer's careers page or job board to start." /> : (
           <table className="w-full">
