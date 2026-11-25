@@ -60,7 +60,7 @@ function SourceModal({ src, options, onClose, onSaved }) {
         </div>
         <label className="flex items-center justify-between rounded-xl bg-brand-mist p-4 text-sm font-semibold">Enabled for collection
           <Switch checked={f.enabled} onChange={set("enabled")} data-testid="src-enabled" /></label>
-        <p className="text-xs text-gray-500">Only add sources that permit automated collection: an employer's own careers page or job board, an authorised API or feed, or a licensed provider. LinkedIn, Naukri and similar portals can't be added without a licence.</p>
+        <p className="text-xs text-gray-500">Only add sources that permit automated collection: an employer's own careers page or job board, an authorised API or feed, or a licensed provider. LinkedIn URLs are collected with the LinkedIn Actor (bebity/linkedin-jobs-scraper): use a company page (linkedin.com/company/…) to get that company's jobs, a LinkedIn job-search URL, or https://www.linkedin.com/jobs for a search by the keywords and locations above. Naukri and similar portals can't be added without a licence.</p>
         <Button title="Save source" loading={busy} onClick={save} data-testid="src-save" />
       </div>
     </Modal>

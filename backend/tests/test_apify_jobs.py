@@ -93,6 +93,34 @@ def test_normalise_real_ats_jobs_search_item():
     assert normalise({**real, "countries": [], "location": "Gurugram"})["region"] == "India"
 
 
+# Shape copied from a real bebity/linkedin-jobs-scraper run (Nov 2026).
+LINKEDIN_ITEM = {
+    "id": "4477826957", "publishedAt": "2026-11-21", "salary": "", "title": "Software Development Engineer, AWS DynamoDB",
+    "jobUrl": "https://in.linkedin.com/jobs/view/software-development-engineer-aws-dynamodb-at-amazon-web-services-aws-4477826957"
+              "?trk=public_jobs_topcard-title",
+    "companyName": "Amazon Web Services (AWS)", "companyUrl": "https://www.linkedin.com/company/amazon-web-services?trk=x",
+    "location": "Bengaluru, Karnataka, India", "postedTime": "3 days ago", "applicationsCount": "Over 200 applicants",
+    "description": ZETA_DESC, "contractType": "Full-time", "experienceLevel": "Mid-Senior level", "workType": "Hybrid",
+    "sector": "IT Services and IT Consulting", "applyType": "EXTERNAL", "applyUrl": "", "companyId": "2382910",
+    "scrapingInfo": {"page": 1, "index": 2, "inputUrl": "", "title": "Software Engineer", "location": "Bengaluru"},
+}
+
+
+def test_normalise_real_linkedin_item():
+    n = normalise({**LINKEDIN_ITEM, "publishedAt": _today().isoformat()})
+    assert (n["title"], n["company"]) == ("Software Development Engineer, AWS DynamoDB", "Amazon Web Services (AWS)")
+    assert n["original_url"] == "https://www.linkedin.com/jobs/view/4477826957"
+    assert n["application_link"].startswith("https://in.linkedin.com/jobs/view/"), "no applyUrl: apply on LinkedIn"
+    assert (n["region"], n["city"], n["work_mode"], n["employment_type"]) == ("India", "Bengaluru", "Hybrid", "Full-time")
+    assert n["external_id"] == "4477826957" and n["salary_range"] == "" and n["flags"] == []
+    assert normalise({**LINKEDIN_ITEM, "applyUrl": "https://acme.com/apply"})["application_link"] == "https://acme.com/apply"
+
+
+def test_norm_url_linkedin_canonical():
+    assert norm_url("https://www.linkedin.com/jobs/view/4485302230/?refId=a&trackingId=b") == \
+        "https://www.linkedin.com/jobs/view/4485302230"
+
+
 # --------------------------------------------------------------------------- fake Apify API
 class Fake:
     items: list = []
@@ -194,7 +222,7 @@ class TestApifyFlow:
     def test_flow(self):
         api, h = self.api, self.h
         self.settings(paid_runs_approved=False)
-        bad = {"name": "TEST_APIFY LinkedIn", "url": "https://www.linkedin.com/jobs", "permission_status": "Approved", "enabled": True}
+        bad = {"name": "TEST_APIFY Naukri", "url": "https://www.naukri.com/jobs", "permission_status": "Approved", "enabled": True}
         assert requests.post(f"{api}/admin/sources", headers=h, json=bad).status_code == 400
         pending = {"name": "TEST_APIFY Air", "url": "https://job-boards.greenhouse.io/testapifyair", "enabled": True,
                    "permission_status": "Pending review"}
@@ -285,6 +313,31 @@ class TestApifyFlow:
         assert doc["processed"] and doc["summary"]["created"] == 1
         job = self.db.jobs.find_one({"source_id": sid})
         assert job["region"] == "India" and job["country"] == "India" and job["review_status"] == "new_import"
+
+    def test_linkedin_source_uses_linkedin_actor(self):
+        api, h = self.api, self.h
+        self.settings(default_keywords=["Software Engineer"], default_locations=["Bengaluru"], max_items_per_run=40,
+                      posted_within_days=7)
+        r = requests.post(f"{api}/admin/sources", headers=h, json={
+            "name": "TEST_APIFY LinkedIn Co", "url": "https://www.linkedin.com/company/testapifyli/", "enabled": True,
+            "permission_status": "Approved", "permission_note": "LinkedIn via Apify"})
+        assert r.status_code == 200, r.text
+        src = r.json()["source"]
+        assert src["actor_id"] == "bebity/linkedin-jobs-scraper"
+        li = {**LINKEDIN_ITEM, "companyName": "TEST_APIFY LinkedIn Co", "title": "TEST_APIFY SDE",
+              "companyUrl": "https://www.linkedin.com/company/testapifyli?trk=x"}
+        Fake.started.clear()
+        doc = self.run_and_import(src["source_id"], [li, {**li, "jobUrl": li["jobUrl"].replace("in.linkedin", "www.linkedin")}], 2)
+        started = Fake.started[-1]
+        assert started["actor"] == "bebity~linkedin-jobs-scraper"
+        assert started["input"]["titles"] == ["Software Engineer"] and started["input"]["locations"] == ["Bengaluru"]
+        assert started["input"]["companyUrls"] == ["https://www.linkedin.com/company/testapifyli/"]
+        assert started["input"]["rows"] == 40 and started["input"]["publishedAt"] == "r604800"
+        assert started["input"]["enrichCompany"] is False
+        # The same job seen on in.linkedin.com and www.linkedin.com is one job.
+        assert doc["summary"]["created"] == 1 and doc["summary"]["skipped"] == 1
+        job = self.db.jobs.find_one({"source_id": src["source_id"]})
+        assert job["original_url"] == "https://www.linkedin.com/jobs/view/4477826957" and job["region"] == "India"
 
     def test_cron_once_per_day(self):
         secret = os.environ.get("WEBHOOK_CRON_SECRET", "local-dev-cron-secret")

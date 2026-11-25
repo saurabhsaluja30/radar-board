@@ -31,6 +31,7 @@ Web version of the user's RADAR mobile app (github.com/saurabhsaluja30/radar-pre
   - Resume file keys wrapped with RESUME_KEK (legacy keys wrapped at startup); uploads refuse to run without it.
   - Index creation is per index (one failure no longer skips the rest).
   - Payments: payment marked successful only after activation; stale "running" activations are taken over; activation idempotent per payment; failed webhooks are reprocessed on Razorpay retry; full refunds revoke access (refunded renewals give back only their days); RAZORPAY_API_BASE only honoured for test keys on localhost; order creation rate-limited.
+- 2026-11: Apify: ISO country codes (IN) count as India; daily/poll/SmartMatch/resume-retry crons registered; 15-min poll imports finished runs without the webhook. LinkedIn sources via bebity/linkedin-jobs-scraper (~$0.0015/job): linkedin.com URLs are routed to it automatically (company page → that company's jobs; job-search URL → scraped as-is; linkedin.com/jobs → keyword × location search); job URLs canonicalised to www.linkedin.com/jobs/view/<id>; paid enrichment off.
 
 ## Environment
 | Variable | Required | Purpose |

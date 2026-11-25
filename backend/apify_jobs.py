@@ -33,7 +33,11 @@ DEFAULT_ACTOR = "yugenox/ats-jobs-search"
 ACTOR_PRESETS = {
     "yugenox/ats-jobs-search": {"label": "Greenhouse, Lever & Ashby employer boards", "price_per_item_usd": 0.002},
     "fantastic-jobs/career-site-job-listing-api": {"label": "Career sites on 58 ATS platforms (incl. Workday)", "price_per_item_usd": 0.012},
+    "bebity/linkedin-jobs-scraper": {"label": "LinkedIn job search (titles × locations, or company pages)", "price_per_item_usd": 0.0015},
 }
+LINKEDIN_ACTOR = "bebity/linkedin-jobs-scraper"
+LINKEDIN_URL = re.compile(r"^https?://([a-z]{2,3}\.)?(www\.)?linkedin\.com/", re.I)
+LINKEDIN_JOB = re.compile(r"^https?://([a-z]{2,3}\.)?(www\.)?linkedin\.com/jobs/view/(?:[^/?#]*-)?(\d{6,})", re.I)
 DEFAULT_SETTINGS = {
     "actor_id": DEFAULT_ACTOR, "default_keywords": [], "default_locations": ["India"], "max_items_per_run": 200,
     "max_items_per_company": 25, "posted_within_days": 30, "monthly_budget_usd": 15.0, "per_run_cap_usd": 2.0,
@@ -47,7 +51,7 @@ REVIEW = ["new_import", "pending_review", "approved", "rejected", "archived"]
 FINAL_STATES = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
 SUSPICIOUS = re.compile(r"registration fee|pay(?:ment)? to apply|security deposit|processing fee|whatsapp\s*(?:us|me|on)|"
                         r"telegram|work from home and earn|earn \d+ ?(?:per|/) ?day|no interview|guaranteed job", re.I)
-TRACKING_PARAMS = re.compile(r"^(utm_|gh_src|gh_jid$|source$|ref$|lever-source|lever-origin)", re.I)
+TRACKING_PARAMS = re.compile(r"^(utm_|gh_src|gh_jid$|source$|ref$|lever-source|lever-origin|trk$|refId$|trackingId$)", re.I)
 
 
 # --------------------------------------------------------------------------- normalisation (pure)
@@ -64,6 +68,9 @@ def _first(item: dict, *keys):
 def norm_url(u: Optional[str]) -> Optional[str]:
     if not u or not isinstance(u, str):
         return None
+    m = LINKEDIN_JOB.match(u.strip())
+    if m:  # in.linkedin.com/jobs/view/<slug>-<id>?trk=… and www.linkedin.com/jobs/view/<id> are the same job
+        return f"https://www.linkedin.com/jobs/view/{m.group(3)}"
     p = urlsplit(u.strip())
     if p.scheme not in ("http", "https") or not p.netloc:
         return None
@@ -101,7 +108,7 @@ def _experience(text: str):
 
 
 def _work_mode(item: dict) -> Optional[str]:
-    v = str(_first(item, "workplaceType", "ai_work_arrangement", "location_type", "workMode") or "").lower()
+    v = str(_first(item, "workplaceType", "ai_work_arrangement", "location_type", "workMode", "workType") or "").lower()
     if item.get("isRemote") is True or "remote" in v:
         return "Remote"
     if "hybrid" in v:
@@ -112,7 +119,7 @@ def _work_mode(item: dict) -> Optional[str]:
 
 
 def _employment(item: dict) -> Optional[str]:
-    v = str(_first(item, "employmentType", "employment_type", "ai_employment_type") or "").lower().replace("_", "-")
+    v = str(_first(item, "employmentType", "employment_type", "ai_employment_type", "contractType") or "").lower().replace("_", "-")
     for key, label in (("full", "Full-time"), ("part", "Part-time"), ("contract", "Contract"), ("temp", "Contract"),
                        ("intern", "Internship")):
         if key in v:
@@ -178,14 +185,15 @@ def normalise(item: dict) -> dict:
         "salary_min": float(smin) if isinstance(smin, (int, float)) else None,
         "salary_max": float(smax) if isinstance(smax, (int, float)) else None,
         "currency": _first(item, "salaryCurrency", "ai_salary_currency"),
-        "salary_range": _first(item, "salaryText") or "",
+        "salary_range": str(_first(item, "salaryText", "salary") or "")[:120] if not isinstance(item.get("salary"), dict) else "",
         "required_skills": ", ".join(skills), "experience_min": exp_min, "experience_max": exp_max,
         "application_link": apply_url if isinstance(apply_url, str) else "", "source_link": url or "",
         "original_url": url, "original_posted_at": _date(_first(item, "postedAt", "date_posted", "datePosted", "publishedAt")),
         "application_deadline": _date(_first(item, "applicationDeadline", "date_valid_through")) or "",
         "external_id": str(_first(item, "jobId", "id", "internalJobId") or "")[:80],
         "closed_at_source": str(item.get("changeType") or "").lower() == "closed",
-        "board": " ".join(str(item.get(k) or "") for k in ("companyBoardUrl", "companyToken", "company", "organization")).lower(),
+        "board": " ".join(str(item.get(k) or "") for k in ("companyBoardUrl", "companyToken", "company", "organization",
+                                                           "companyName", "companyUrl")).lower(),
     }
     flags = []
     if not (title and company and desc and url):
@@ -273,6 +281,19 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
     def actor_input(actor_id: str, srcs: List[dict], s: dict, keywords: List[str], locations: List[str]) -> dict:
         if srcs[0].get("actor_input"):
             return dict(srcs[0]["actor_input"])
+        if actor_id == LINKEDIN_ACTOR:
+            # Source URLs: a LinkedIn company page narrows the title × location search to that company; a pasted
+            # LinkedIn job-search URL is scraped as-is. "https://www.linkedin.com/jobs" means a broad search.
+            companies = [x["url"] for x in srcs if re.search(r"linkedin\.com/company/", x["url"], re.I)]
+            searches = [x["url"] for x in srcs if re.search(r"linkedin\.com/jobs/search", x["url"], re.I)]
+            days = s["posted_within_days"]
+            out = {"titles": keywords, "locations": locations, "companyUrls": companies,
+                   "rows": max(1, s["max_items_per_run"] // max(1, len(keywords) * max(1, len(locations)))),
+                   "publishedAt": "r86400" if days <= 1 else "r604800" if days <= 7 else "r2592000",
+                   "companyProfile": False, "enrichCompany": False}  # enrichment is billed per job
+            if searches:
+                out.update(startUrls=searches, maxRowsPerUrl=max(1, s["max_items_per_run"] // len(searches)))
+            return out
         if actor_id == "fantastic-jobs/career-site-job-listing-api":
             return {"organizationSearch": [x["name"] for x in srcs], "titleSearch": keywords, "locationSearch": locations,
                     "limit": s["max_items_per_run"], "timeRange": "7d", "descriptionType": "text"}
@@ -281,11 +302,19 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
                 "postedWithinDays": s["posted_within_days"], "includeDescription": True, "onlyNewOrChanged": True,
                 "stateKey": "jobradar-" + hashlib.sha1("|".join(sorted(x["source_id"] for x in srcs)).encode()).hexdigest()[:12]}
 
+    def source_actor(x: dict, s: dict) -> str:
+        """A source's own Actor; LinkedIn URLs always use the LinkedIn Actor, and other URLs never do."""
+        if x.get("actor_id"):
+            return x["actor_id"]
+        if LINKEDIN_URL.match(x.get("url") or ""):
+            return LINKEDIN_ACTOR
+        return DEFAULT_ACTOR if s["actor_id"] == LINKEDIN_ACTOR else s["actor_id"]
+
     def groups(srcs: List[dict], s: dict) -> List[List[dict]]:
         """Sources sharing an Actor and filters run together, so a daily cycle is one run in the common case."""
         out: Dict[tuple, List[dict]] = {}
         for x in srcs:
-            actor = x.get("actor_id") or s["actor_id"]
+            actor = source_actor(x, s)
             key = (actor, tuple(sorted(x.get("keywords") or s["default_keywords"])),
                    tuple(sorted(x.get("locations") or s["default_locations"])), x["source_id"] if x.get("actor_input") else "")
             out.setdefault(key, []).append(x)
@@ -306,7 +335,7 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
             if remaining <= 0.01:
                 raise HTTPException(409, f"This month's Apify budget (${s['monthly_budget_usd']}) is used up (${spent} spent).")
             cap = round(min(s["per_run_cap_usd"], remaining), 2)
-            actor = grp[0].get("actor_id") or s["actor_id"]
+            actor = source_actor(grp[0], s)
             kws = grp[0].get("keywords") or s["default_keywords"]
             locs = grp[0].get("locations") or s["default_locations"]
             params: Dict[str, Any] = {"maxTotalChargeUsd": cap}
@@ -574,9 +603,16 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
             raise HTTPException(400, "Frequency must be daily, weekly or manual")
         if d["enabled"] and d["permission_status"] != "Approved":
             raise HTTPException(400, "Only sources with permission status Approved can be enabled")
-        if re.search(r"linkedin\.com|naukri\.com|indeed\.|glassdoor\.|monster\.|shine\.com|foundit\.", d["url"], re.I) \
+        if LINKEDIN_URL.match(d["url"].strip()):
+            # LinkedIn URLs are collected with the LinkedIn Actor, whatever the global default Actor is.
+            if d["actor_id"] and d["actor_id"] != LINKEDIN_ACTOR and not d["actor_input"]:
+                raise HTTPException(400, f"LinkedIn sources are collected with {LINKEDIN_ACTOR}")
+            d["actor_id"] = d["actor_id"] or LINKEDIN_ACTOR
+        elif d["actor_id"] == LINKEDIN_ACTOR:
+            d["actor_id"] = None  # the URL was changed away from LinkedIn: fall back to the default Actor
+        if not LINKEDIN_URL.match(d["url"].strip()) and re.search(r"naukri\.com|indeed\.|glassdoor\.|monster\.|shine\.com|foundit\.", d["url"], re.I) \
                 and d["source_type"] != "Licensed job data provider":
-            raise HTTPException(400, "Job portals like LinkedIn and Naukri can't be collected without a licence or approved API. "
+            raise HTTPException(400, "Job portals like Naukri and Indeed can't be collected without a licence or approved API. "
                                      "Add the employer's own careers page instead.")
         d.update(name=d["name"].strip()[:120], url=d["url"].strip()[:500], keywords=clean_list(d["keywords"]),
                  locations=clean_list(d["locations"]), permission_note=d["permission_note"][:500])
