@@ -58,7 +58,22 @@ PHONE_PAT = re.compile(r"(?<!\d)(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{2,5}\)?[\s-]?)?\d{
 LABEL = r"\s*[:\-–]\s*"
 DETAIL_LINE = re.compile(r"^\s*(?:notice\s+period|current\s+ctc|expected\s+ctc|current\s+salary|expected\s+salary|ctc|salary|"
                          r"location|address|phone|mobile|email|date\s+of\s+birth|dob|nationality|gender|marital\s+status|"
-                         r"languages?\s+known)\s*[:\-–]", re.I)
+                         r"languages?(?:\s+known)?|preferred\s+[a-z ]{0,20}|willing\s+to\s+relocate[a-z ]{0,6}|"
+                         r"open\s+to\s+relocat[a-z ]{0,8}|objective|career\s+objective|desired\s+[a-z ]{0,20}|"
+                         r"looking\s+for|target\s+roles?|linkedin|github|portfolio|website)\s*[:\-–]", re.I)
+YEAR_PAT = re.compile(r"(?<!\d)(19[5-9]\d|20[0-4]\d)(?!\d)")
+URL_PAT = re.compile(r"(?<![@\w.])(?:https?://)?(?:www\.)?(?:linkedin\.com/(?:in|pub)/[\w\-%.]+|github\.com/[\w\-.]+"
+                     r"|[\w\-]+\.(?:github\.io|vercel\.app|netlify\.app|wixsite\.com|wordpress\.com|behance\.net|"
+                     r"dribbble\.com)(?:/[\w\-./%]*)?)/?|https?://[^\s<>()\"',;|]+", re.I)
+PORTFOLIO_LINE = re.compile(r"^\s*(?:portfolio|website|personal\s+website|blog|linkedin|github)\s*[:\-–]\s*"
+                            r"((?:https?://)?[\w\-]+(?:\.[\w\-]+)+(?:/[^\s,;|]*)?)", re.I | re.M)
+TITLE_LABELS = (r"(?:career\s+)?objective|desired\s+(?:role|roles|position|positions|job\s+titles?|designation)|"
+                r"looking\s+for|preferred\s+(?:roles?|positions?|designations?|job\s+titles?|job\s+roles?)|target\s+roles?")
+LOCATION_LABELS = (r"preferred\s+(?:job\s+|work\s+)?(?:locations?|cit(?:y|ies))|willing\s+to\s+relocate(?:\s+to)?|"
+                   r"open\s+to\s+relocat(?:e|ion)(?:\s+to)?")
+PROFICIENCY = re.compile(r"\((?:[^)]*)\)|\b(?:fluent|native|basic|intermediate|advanced|beginner|proficient|"
+                         r"professional|working|elementary|conversational|mother\s+tongue|read|write|speak|"
+                         r"reading|writing|speaking|proficiency|full|limited)\b", re.I)
 
 
 def _parse_date(s: str, end: bool) -> Optional[Tuple[int, int]]:
@@ -183,6 +198,101 @@ def _ctc(text: str, labels: str) -> Optional[str]:
     return raw if raw and re.search(r"\d", raw) else None
 
 
+def _split_items(raw: str) -> List[str]:
+    return [_clean_line(x) for x in re.split(r"[,;/|•]|\s+(?:and|or|&)\s+", raw or "") if _clean_line(x)]
+
+
+def _languages(text: str, sec: Dict[str, List[str]]) -> List[str]:
+    raws = [m.group(1) for m in re.finditer(rf"^\s*languages?(?:\s+known)?{LABEL}(.+)$", text, re.I | re.M)]
+    raws += sec.get("languages", [])[:8]
+    tech = {t.lower() for t in SKILLS["technical"]}
+    out = []
+    for raw in raws:
+        for item in _split_items(PROFICIENCY.sub(" ", re.sub(r"^[^:]{1,20}:", "", raw))):
+            item = _clean_line(re.sub(r"[-–:]+", " ", item))
+            if re.fullmatch(r"[A-Za-z]{3,20}(?: [A-Za-z]{3,20})?", item) and item.lower() not in tech:
+                out.append(item.title())
+    return list(dict.fromkeys(out))[:10]
+
+
+def _links(text: str) -> List[str]:
+    found = [m.group(0) for m in URL_PAT.finditer(text)] + [m.group(1) for m in PORTFOLIO_LINE.finditer(text)]
+    out = []
+    for u in found:
+        u = u.rstrip(".,;:)/")
+        if "@" in u or len(u) > 200:
+            continue
+        if not re.match(r"https?://", u, re.I):
+            u = "https://" + u
+        out.append(u)
+    # Keep one spelling per address (with/without scheme or www).
+    seen, uniq = set(), []
+    for u in out:
+        k = re.sub(r"^https?://(?:www\.)?", "", u.lower())
+        if k not in seen:
+            seen.add(k)
+            uniq.append(u)
+    return uniq[:10]
+
+
+def _degree_segment(ln: str) -> Optional[str]:
+    for seg in re.split(r"\s*[,|–—]\s*|\s+-\s+|\s+from\s+|\s+at\s+", ln):
+        seg = YEAR_PAT.sub("", re.sub(r"\(.*?\)", "", seg))
+        if any(re.search(p, seg + " ", re.I) for _, p in DEGREES):
+            inst = INSTITUTION_PAT.search(seg)
+            if inst and inst.start() > 0:
+                seg = seg[:inst.start()]
+            seg = _clean_line(re.sub(r"\b(?:from|at|in)\s*$", "", seg.strip(), flags=re.I))
+            if seg and len(seg) <= 80:
+                return seg
+    return None
+
+
+def _education(sec: Dict[str, List[str]]) -> List[dict]:
+    lines = sec.get("education")
+    strict = not lines  # no Education heading: only lines naming a degree AND an institution or year count
+    lines = lines or [ln for sl in sec.values() for ln in sl]
+    out: List[dict] = []
+    for ln in lines[:200]:
+        if DETAIL_LINE.match(ln):
+            continue
+        deg = _degree_segment(ln)
+        inst_m = INSTITUTION_PAT.search(ln)
+        inst = _clean_line(YEAR_PAT.sub("", re.sub(r"\(.*?\)", "", inst_m.group(0))))[:120] if inst_m else None
+        years = YEAR_PAT.findall(ln)
+        year = years[-1] if years else None
+        if deg:
+            if strict and not (inst or year):
+                continue
+            out.append({"degree": deg, "institution": inst or None, "year": year})
+        elif not strict and out and (inst or year) and not (out[-1]["institution"] and out[-1]["year"]):
+            # Two-line layout: degree on one line, institution / year on the next.
+            if inst and not out[-1]["institution"]:
+                out[-1]["institution"] = inst
+            if year and not out[-1]["year"]:
+                out[-1]["year"] = year
+        elif not strict and inst:
+            out.append({"degree": None, "institution": inst, "year": year})
+    return out[:8]
+
+
+def _preferred(text: str, labels: str, max_words: int) -> List[str]:
+    out = []
+    for m in re.finditer(rf"^\s*(?:{labels}){LABEL}(.+)$", text, re.I | re.M):
+        if re.match(r"^\s*(?:no|not)\b", m.group(1), re.I):
+            continue
+        raw = re.sub(r"^\s*yes\b\s*[,:\-–(]?\s*", "", m.group(1), flags=re.I)
+        for item in _split_items(raw.rstrip(").")):
+            item = re.sub(r"^(?:an?|the)\s+|\s+(?:roles?|positions?|opportunities|jobs?)$", "", item, flags=re.I).strip()
+            words = item.split()
+            # Prose ("To obtain a challenging position…") isn't a title, so only short phrases count.
+            if not words or len(words) > max_words or re.match(r"(?:to|seeking|i|my|in|with|where)\b", item, re.I) \
+                    or re.search(r"\d|\b(?:anywhere|any|open|willing|yes)\b", item, re.I):
+                continue
+            out.append(item[:60])
+    return list(dict.fromkeys(out))[:10]
+
+
 def extract(text: str) -> dict:
     """Structured fields found in resume text. Keys with nothing found are omitted."""
     text = (text or "")[:60000]
@@ -266,6 +376,22 @@ def extract(text: str) -> dict:
     notice = _notice(text)
     if notice:
         out["notice_period"] = notice
+
+    langs = _languages(text, sec)
+    if langs:
+        out["languages"] = langs
+    links = _links(text)
+    if links:
+        out["links"] = links
+    edu = _education(sec)
+    if edu:
+        out["education"] = edu
+    titles = _preferred(text, TITLE_LABELS, 6) or ([out["current_designation"]] if out.get("current_designation") else [])
+    if titles:
+        out["preferred_titles"] = titles
+    locs = _preferred(text, LOCATION_LABELS, 4) or ([out["current_location"]] if out.get("current_location") else [])
+    if locs:
+        out["preferred_locations"] = locs
     return out
 
 

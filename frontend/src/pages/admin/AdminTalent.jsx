@@ -60,8 +60,19 @@ function CandidateModal({ id, onClose }) {
             <p className="md:col-span-2"><b>Tools:</b> {list(c.tools)}</p>
             <p><b>Education:</b> {c.highest_qualification || "—"} {c.institution ? `· ${c.institution}` : ""}</p>
             <p><b>Certifications:</b> {list(c.certifications)}</p>
+            <p><b>Preferred titles:</b> {list(c.preferred_titles?.length ? c.preferred_titles : c.preferred_designation)}</p>
+            <p><b>Languages:</b> {list(c.languages)}</p>
+            <p className="md:col-span-2 break-all"><b>Links:</b> {c.links?.length ? c.links.map((l, i) => (
+              <React.Fragment key={l}>{i ? ", " : ""}{/^https?:\/\//i.test(l) ? <a href={l} target="_blank" rel="noopener noreferrer nofollow" className="text-brand underline">{l}</a> : l}</React.Fragment>
+            )) : "—"}</p>
             <p><b>Profile completion:</b> {c.completion}%{c.missing?.length ? ` (missing ${c.missing.slice(0, 4).join(", ")}${c.missing.length > 4 ? "…" : ""})` : ""}</p>
           </div>
+          {c.education?.length ? (
+            <div className="rounded-xl bg-gray-50 p-3 text-sm" data-testid="talent-education">
+              <p className="mb-1 font-bold">Education</p>
+              {c.education.map((e, i) => <p key={i}>{[e.degree, e.institution, e.year].filter(Boolean).join(" · ")}</p>)}
+            </div>
+          ) : null}
           {c.employment_history?.length ? (
             <div className="rounded-xl bg-gray-50 p-3 text-sm">
               <p className="mb-1 font-bold">Employment history</p>
@@ -73,14 +84,25 @@ function CandidateModal({ id, onClose }) {
             {!data.resumes.length ? <p className="text-sm text-gray-500">No resume uploaded.</p> : data.resumes.map((r) => (
               <div key={r.resume_id} className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-gray-200 p-3 text-sm">
                 <span>v{r.version} · {r.original_filename} · {formatDate(r.uploaded_at)} {r.is_current ? <Badge label="Current" color="brand" /> : null}</span>
-                <span className="flex gap-2">
-                  <Button size="sm" variant="outline" title="View" onClick={() => open(r, false)} data-testid={`talent-view-${r.resume_id}`} />
-                  <Button size="sm" variant="outline" title="Download" onClick={() => open(r, true)} />
-                </span>
+                {r.source === "paste" ? <span className="text-xs text-gray-500">Pasted as text</span> : (
+                  <span className="flex gap-2">
+                    <Button size="sm" variant="outline" title="View" onClick={() => open(r, false)} data-testid={`talent-view-${r.resume_id}`} />
+                    <Button size="sm" variant="outline" title="Download" onClick={() => open(r, true)} />
+                  </span>
+                )}
               </div>
             ))}
             <p className="text-xs text-gray-400">Every resume view and download is recorded in the admin audit log.</p>
           </div>
+          {data.raw_text ? (
+            <div className="space-y-2" data-testid="talent-cv-text">
+              <div className="flex items-center justify-between gap-2">
+                <p className="font-bold">CV text</p>
+                <Button size="sm" variant="outline" title="Copy" onClick={() => navigator.clipboard.writeText(data.raw_text).then(() => notify("CV text copied", "success"), () => notify("Couldn't copy", "error"))} />
+              </div>
+              <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-xl bg-gray-50 p-3 font-sans text-xs text-gray-700">{data.raw_text}</pre>
+            </div>
+          ) : data.resumes.length && !data.can_view_cv_text ? <p className="text-xs text-gray-400">You need the "view resumes" permission to see the CV text.</p> : null}
         </div>
       )}
     </Modal>

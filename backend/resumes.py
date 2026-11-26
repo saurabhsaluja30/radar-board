@@ -3,6 +3,10 @@
 Resume files are encrypted with a per-file key before they reach object storage (see storage.py). That key is
 stored wrapped with the RESUME_KEK master key, so the database alone cannot decrypt files. Deleting a resume
 destroys its key, so the stored bytes can never be read again even though the storage API has no delete.
+
+A CV can also be pasted as text (POST /resume/paste). Pasted text, and the text read from uploaded files, is kept
+as plain text in `candidate_resumes.raw_text` (by product decision: not encrypted). Admins with `view_resumes` can
+read it and admins with `export_candidates` get it in the Excel export. Deleting a resume removes the text.
 """
 import asyncio
 import base64
@@ -46,13 +50,23 @@ CONFIRMABLE = {
     "notice_period": "notice", "highest_qualification": "str", "institution": "str",
     "primary_skills": "list", "tools": "list", "certifications": "list", "previous_companies": "list",
     "industry_experience": "list", "employment_history": "history",
+    "preferred_titles": "list", "preferred_locations": "list", "languages": "list", "links": "links",
+    "education": "education",
 }
+PASTE_MIN, PASTE_MAX = 200, 50000
+RAW_TEXT_MAX = 100000  # text read from an uploaded file, kept as plain text for matching and the talent database
+CSV_CELL_MAX = 32000  # Excel's per-cell limit is 32,767 characters
+EXPORT_EXTRA = ["preferred_titles", "languages", "links", "education"]
 # Parser output key → profile field.
 EXTRACT_TO_PROFILE = {"phone": "mobile", "skills": "primary_skills", "current_ctc": "current_salary"}
 
 
 class ConfirmReq(BaseModel):
     fields: Dict[str, Any]
+
+
+class PasteReq(BaseModel):
+    text: str
 
 
 class SettingsReq(BaseModel):
@@ -100,7 +114,40 @@ def _coerce(field: str, kind: str, v):
             if isinstance(e, dict):
                 out.append({k: str(e.get(k) or "").strip()[:80] for k in ("title", "company", "start", "end")})
         return out
+    if kind == "links":
+        out = []
+        for u in _clean_list(v)[:10]:
+            if not re.match(r"https?://", u, re.I):
+                if re.match(r"^[a-z][a-z0-9+.-]*:", u, re.I) and not re.match(r"^[\w.-]+:\d", u):
+                    raise HTTPException(400, "Links must be web addresses (https://…)")
+                u = "https://" + u
+            if not re.fullmatch(r"https?://[\w\-]+(?:\.[\w\-]+)+(?::\d+)?(?:[/?#]\S*)?", u, re.I):
+                raise HTTPException(400, f"“{u[:60]}” isn't a valid web address")
+            out.append(u)
+        return out
+    if kind == "education":
+        out = []
+        for e in (v or [])[:8] if isinstance(v, list) else []:
+            if isinstance(e, dict):
+                row = {k: str(e.get(k) or "").strip()[:120] for k in ("degree", "institution", "year")}
+                if row["year"] and not re.fullmatch(r"(?:19|20)\d\d", row["year"]):
+                    raise HTTPException(400, "Education year must be a 4-digit year")
+                if row["degree"] or row["institution"]:
+                    out.append(row)
+        return out or None
     return None
+
+
+def csv_cell(v) -> str:
+    """Flatten a value for the Excel export, and stop text that starts with a formula character from running
+    as a formula when the file is opened (CSV injection)."""
+    if isinstance(v, list):
+        v = "; ".join(", ".join(str(x) for x in (e.get("degree"), e.get("institution"), e.get("year")) if x)
+                      if isinstance(e, dict) else str(e) for e in v)
+    s = "" if v is None else str(v)
+    if s[:1] in ("=", "@", "\t", "\r") or (s[:1] in ("+", "-") and not re.match(r"[+-][\d\s(]", s)):
+        s = "'" + s
+    return s
 
 
 def validate_file(name: str, data: bytes) -> str:
@@ -155,7 +202,7 @@ def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on
         return {k: s.get(k, v) for k, v in DEFAULT_SETTINGS.items()}
 
     def public(rec: dict) -> dict:
-        return {k: v for k, v in rec.items() if k not in ("enc_key", "enc_key_wrapped", "storage_path", "lock_until", "_id")}
+        return {k: v for k, v in rec.items() if k not in ("enc_key", "enc_key_wrapped", "storage_path", "lock_until", "_id", "raw_text")}
 
     async def require_candidate(user=Depends(get_current_user)):
         if user.get("role") != "candidate":
@@ -202,7 +249,7 @@ def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on
             res = await db.candidate_resumes.update_one(
                 {"resume_id": rec["resume_id"], "status": "processing"},
                 {"$set": {"status": "parsed", "extracted": fields, "parsed_at": now_iso(), "error": None, "lock_until": None,
-                          "text_chars": len(text)}})
+                          "text_chars": len(text), "raw_text": text[:RAW_TEXT_MAX]}})
             if res.modified_count and rec.get("is_current"):
                 await refresh_user_resume_fields(rec["candidate_id"])
         except Exception as e:  # noqa: BLE001 - recorded on the record and retried by the cron
@@ -228,7 +275,7 @@ def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on
     @r.get("/resume")
     async def my_resumes(user=Depends(require_candidate)):
         recs = await db.candidate_resumes.find({"candidate_id": user["user_id"], "status": {"$ne": "deleted"}},
-                                               {"_id": 0, "enc_key": 0, "enc_key_wrapped": 0, "storage_path": 0, "lock_until": 0}
+                                               {"_id": 0, "enc_key": 0, "enc_key_wrapped": 0, "storage_path": 0, "lock_until": 0, "raw_text": 0}
                                                ).sort("version", -1).to_list(20)
         s = await settings()
         return {"resumes": recs, "current": next((x for x in recs if x.get("is_current")), None),
@@ -283,6 +330,41 @@ def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on
         bg(drain(["queued"], 3))
         return {"resume": public(rec), "duplicate": False}
 
+    @r.post("/resume/paste")
+    async def paste(req: PasteReq, user=Depends(require_candidate)):
+        """CV pasted as text: no file, so no object storage or encryption key is needed. The text is stored as
+        plain text (raw_text) and read straight away, so the confirm screen can open in the same response."""
+        text = re.sub(r"\r\n?", "\n", (req.text or "").replace("\x00", "")).strip()
+        if len(text) < PASTE_MIN:
+            raise HTTPException(400, f"Please paste your full CV — at least {PASTE_MIN} characters.")
+        if len(text) > PASTE_MAX:
+            raise HTTPException(400, f"That's too long. Please paste at most {PASTE_MAX:,} characters.")
+        uid = user["user_id"]
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        same = await db.candidate_resumes.find_one(
+            {"candidate_id": uid, "sha256": digest, "source": "paste", "status": {"$ne": "deleted"}},
+            {"_id": 0, "enc_key": 0, "enc_key_wrapped": 0, "storage_path": 0, "lock_until": 0, "raw_text": 0})
+        if same:
+            if not same.get("is_current"):
+                await db.candidate_resumes.update_many({"candidate_id": uid, "is_current": True}, {"$set": {"is_current": False}})
+                await db.candidate_resumes.update_one({"resume_id": same["resume_id"]}, {"$set": {"is_current": True}})
+                await refresh_user_resume_fields(uid)
+                same["is_current"] = True
+            return {"resume": same, "duplicate": True}
+        fields = await asyncio.to_thread(extract, text)
+        last = await db.candidate_resumes.find_one({"candidate_id": uid}, {"_id": 0, "version": 1}, sort=[("version", -1)])
+        now = now_iso()
+        rec = {"resume_id": f"rs_{uuid.uuid4().hex[:12]}", "candidate_id": uid, "source": "paste",
+               "version": ((last or {}).get("version") or 0) + 1, "is_current": True,
+               "original_filename": "Pasted CV text", "file_type": "text", "content_type": "text/plain",
+               "size": len(text.encode("utf-8")), "sha256": digest, "raw_text": text, "text_chars": len(text),
+               "status": "parsed", "attempts": 0, "lock_until": None, "error": None, "extracted": fields,
+               "uploaded_at": now, "parsed_at": now, "confirmed_at": None, "deleted_at": None}
+        await db.candidate_resumes.update_many({"candidate_id": uid, "is_current": True}, {"$set": {"is_current": False}})
+        await db.candidate_resumes.insert_one(dict(rec))
+        await refresh_user_resume_fields(uid)
+        return {"resume": public(rec), "duplicate": False}
+
     async def own(rid: str, uid: str) -> dict:
         rec = await db.candidate_resumes.find_one({"resume_id": rid, "candidate_id": uid, "status": {"$ne": "deleted"}}, {"_id": 0})
         if not rec:
@@ -330,15 +412,16 @@ def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on
         return {"ok": True, "saved": sorted(updates), "confirmed_fields": confirmed}
 
     async def shred(rec: dict) -> str:
-        how = "already_removed"
-        try:
-            how = await asyncio.to_thread(storage.delete_object, rec["storage_path"])
-        except Exception as e:  # noqa: BLE001 - the key is destroyed regardless, so the file stays unreadable
-            logger.warning(f"resume object removal failed {rec['resume_id']}: {e}")
-            how = "key_destroyed_only"
+        how = "text_removed"  # pasted text: nothing in object storage
+        if rec.get("storage_path"):
+            try:
+                how = await asyncio.to_thread(storage.delete_object, rec["storage_path"])
+            except Exception as e:  # noqa: BLE001 - the key is destroyed regardless, so the file stays unreadable
+                logger.warning(f"resume object removal failed {rec['resume_id']}: {e}")
+                how = "key_destroyed_only"
         await db.candidate_resumes.update_one({"resume_id": rec["resume_id"]}, {
             "$set": {"status": "deleted", "is_current": False, "deleted_at": now_iso(), "extracted": {}, "storage_removal": how},
-            "$unset": {"enc_key": "", "enc_key_wrapped": "", "sha256": ""}})
+            "$unset": {"enc_key": "", "enc_key_wrapped": "", "sha256": "", "raw_text": ""}})
         return how
 
     async def promote_latest(uid: str):
@@ -513,13 +596,22 @@ def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on
     @r.get("/admin/talent/export")
     async def talent_export(request: Request, admin=Depends(require_perm("export_candidates"))):
         f = await filters_with_settings(dict(request.query_params))
-        rows = await db.users.find(talent_query(f), LIST_FIELDS).sort("created_at", -1).to_list(5000)
-        cols = [c for c in LIST_FIELDS if c not in ("_id",)]
+        rows = await db.users.find(talent_query(f), {**LIST_FIELDS, **{c: 1 for c in EXPORT_EXTRA}}
+                                   ).sort("created_at", -1).to_list(5000)
+        texts: Dict[str, str] = {}
+        ids = [u["user_id"] for u in rows]
+        for i in range(0, len(ids), 500):
+            async for rec in db.candidate_resumes.find(
+                    {"candidate_id": {"$in": ids[i:i + 500]}, "is_current": True, "status": {"$ne": "deleted"}},
+                    {"_id": 0, "candidate_id": 1, "raw_text": 1}):
+                texts[rec["candidate_id"]] = (rec.get("raw_text") or "")[:CSV_CELL_MAX]
+        cols = [c for c in LIST_FIELDS if c not in ("_id",)] + EXPORT_EXTRA + ["cv_text"]
         buf = io.StringIO()
         w = csv.writer(buf)
         w.writerow(cols)
         for u in rows:
-            w.writerow(["; ".join(map(str, u.get(c))) if isinstance(u.get(c), list) else u.get(c, "") for c in cols])
+            u["cv_text"] = texts.get(u["user_id"], "")
+            w.writerow([csv_cell(u.get(c)) for c in cols])
         await audit_log(admin, "export_talent_database", "candidate", "-", {"rows": len(rows),
                         "filters": {k: v for k, v in f.items() if not k.startswith("_")}})
         return Response(content=buf.getvalue(), media_type="text/csv",
@@ -535,9 +627,19 @@ def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on
     async def talent_detail(cid: str, admin=Depends(require_admin)):
         u = await consented(cid)
         recs = await db.candidate_resumes.find({"candidate_id": cid, "status": {"$ne": "deleted"}},
-                                               {"_id": 0, "enc_key": 0, "enc_key_wrapped": 0, "storage_path": 0, "lock_until": 0, "sha256": 0}
+                                               {"_id": 0, "enc_key": 0, "enc_key_wrapped": 0, "storage_path": 0, "lock_until": 0,
+                                                "sha256": 0, "raw_text": 0}
                                                ).sort("version", -1).to_list(20)
-        return {"candidate": {**u, **profile_status(u)}, "resumes": recs}
+        # The CV text is resume content, so it follows the same permission (and audit) as viewing a resume file.
+        can_view = bool(admin.get("is_owner") or "view_resumes" in (admin.get("permissions") or []))
+        raw_text = None
+        cur = next((x for x in recs if x.get("is_current")), None)
+        if can_view and cur:
+            raw_text = ((await db.candidate_resumes.find_one({"resume_id": cur["resume_id"]}, {"_id": 0, "raw_text": 1})) or {}
+                        ).get("raw_text")
+            if raw_text:
+                await audit_log(admin, "view_cv_text", "candidate", cid, {"resume_id": cur["resume_id"], "version": cur.get("version")})
+        return {"candidate": {**u, **profile_status(u)}, "resumes": recs, "raw_text": raw_text, "can_view_cv_text": can_view}
 
     @r.get("/admin/talent/{cid}/resume/{rid}")
     async def talent_resume(cid: str, rid: str, download: bool = False, admin=Depends(require_perm("view_resumes"))):
