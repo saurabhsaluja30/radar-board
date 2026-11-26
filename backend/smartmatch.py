@@ -1554,5 +1554,14 @@ def build_router(db, get_current_user, require_admin, compute_membership, send_a
     def invalidate_jobs():
         jobs_cache["at"] = 0.0
 
+    async def relevant_count(user: dict) -> int:
+        """How many live jobs would be recommended to this candidate right now (cached per candidate)."""
+        jobs, scores = await my_scores(user, await related_pairs())
+        return sum(1 for jid, res in scores.items() if relevant(res) and jid in jobs and not job_ineligible_reason(jobs[jid]))
+
+    async def score_job(user: dict, job: dict) -> int:
+        return score_match(user, job, await related_pairs(), await weights())["match_score"]
+
     return r, {"sweep_expired": sweep_expired, "on_tracker_status": on_tracker_status, "invalidate_jobs": invalidate_jobs,
-               "job_changed": job_changed, "candidate_changed": candidate_changed}
+               "job_changed": job_changed, "candidate_changed": candidate_changed, "relevant_count": relevant_count,
+               "score_job": score_job}

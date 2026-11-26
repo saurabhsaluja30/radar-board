@@ -1003,6 +1003,9 @@ async def get_job(job_id: str, user=Depends(get_optional_user)):
     await _sm_helpers["sweep_expired"]()
     job = await db.jobs.find_one(live_job_q(job_id=job_id),
                                  {"_id": 0, "admin_notes": 0, "verification_score": 0})
+    if not job and user and await db.personal_results.find_one({"user_id": user["user_id"], "job_id": job_id}):
+        # Found for this candidate by their own job search: visible to them before an admin publishes it.
+        job = await db.jobs.find_one({"job_id": job_id}, {"_id": 0, "admin_notes": 0, "verification_score": 0})
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     await db.jobs.update_one({"job_id": job_id}, {"$inc": {"views": 1}})
@@ -2104,6 +2107,14 @@ def _index_specs() -> list:
         ("apify_runs", [("processed", 1), ("started_at", -1)], {}),
         ("job_import_logs", [("job_id", 1), ("at", -1)], {}),
         ("job_import_logs", "original_url", {}),
+        ("job_import_logs", "run_id", {}),
+        # Candidate personal job search: one search a day per candidate, shared per title/city/seniority per day.
+        ("personal_quota", [("user_id", 1), ("day", 1)], {"unique": True}),
+        ("personal_searches", [("day", 1), ("pair_key", 1)], {"unique": True}),
+        ("personal_searches", "search_id", {"unique": True}),
+        ("personal_searches", "run_id", {}),
+        ("personal_results", [("user_id", 1), ("job_id", 1)], {"unique": True}),
+        ("personal_results", [("user_id", 1), ("delivered_at", -1)], {}),
         ("job_import_logs", "at_dt", {"expireAfterSeconds": 180 * 24 * 3600}),
         # SmartMatch queue: one queued item per job/candidate at a time; finished items kept 7 days.
         ("match_queue", [("kind", 1), ("ref_id", 1)], {"unique": True, "partialFilterExpression": {"status": "queued"},
@@ -2174,6 +2185,10 @@ from apify_jobs import build_router as _build_apify_router, dedupe_key as _dedup
 
 _apify_router, _apify_helpers = _build_apify_router(db, require_admin, audit_log, now_iso, _bg, _sm_helpers)
 api.include_router(_apify_router)
+from personal_search import build_router as _build_personal_router  # noqa: E402
+
+api.include_router(_build_personal_router(db, get_current_user, compute_membership, serialize_job, now_iso, _sm_helpers,
+                                          _apify_helpers))
 from payments import build_router as _build_payments_router, ensure_indexes as _payment_indexes  # noqa: E402
 api.include_router(_build_payments_router(db, get_current_user, require_admin, _checkout_plan, _activate_subscription,
                                           send_and_log_email, _wrap_email, now_iso, audit_log))

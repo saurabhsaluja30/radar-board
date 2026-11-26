@@ -1,7 +1,7 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Bookmark, Briefcase, Building2, Calendar, ExternalLink, MapPin, Mail, ThumbsDown } from "lucide-react";
+import { AlertTriangle, Bookmark, Briefcase, Building2, Calendar, ExternalLink, MapPin, Mail, Search, ThumbsDown } from "lucide-react";
 import { api } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { formatDate, scoreColor } from "@/lib/constants";
@@ -142,7 +142,72 @@ export function MatchCard({ j, refresh }) {
   );
 }
 
-const TABS = [["shared", "Job Alerts"], ["recommended", "Recommended Jobs"], ["strong", "Strong Matches"], ["recent", "Recently Added"],
+// "Find jobs for me": one live search a day, run in the background. The server allows only one search at a time
+// per candidate, so repeated clicks just return the current status.
+function FindJobs({ search, onChange, onShow }) {
+  const navigate = useNavigate();
+  const [busy, setBusy] = useState(false);
+  if (!search || !search.enabled) return null;
+  const running = search.status === "running";
+  const done = search.status === "done";
+  const start = async () => {
+    setBusy(true);
+    try {
+      const res = await api("/me/job-search", { method: "POST" });
+      if (res.mode === "database") notify(`You already have ${res.matches} good matches below — no new search needed today.`, "success");
+      else if (res.status === "done") notify("New jobs added to 'Found for you'.", "success");
+      else notify("Searching for jobs for you. We'll notify you when they're ready.", "success");
+      onChange();
+    } catch (e) {
+      notify(errMsg(e), "error");
+      if (String(errMsg(e)).includes("CV")) navigate("/profile");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const reset = new Date(search.next_reset_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return (
+    <Card className="mb-6 flex flex-wrap items-center justify-between gap-4" data-testid="find-jobs">
+      <div>
+        <p className="font-extrabold">Find new jobs for me</p>
+        <p className="text-sm text-gray-500">
+          {running ? `Searching${search.searching_for ? ` for ${search.searching_for.title} in ${search.searching_for.city}` : ""}… this usually takes a minute.`
+            : done ? `Today's search found ${search.delivered_today} job${search.delivered_today === 1 ? "" : "s"} for you. Next search after ${reset}.`
+            : `We search for jobs matching your profile — up to ${search.limit} new jobs a day${search.is_member ? "" : " (members get more)"}. Resets at ${reset}.`}
+        </p>
+      </div>
+      <div className="flex gap-2">
+        {search.jobs.length ? <Button variant="outline" title={`Found for you (${search.jobs.length})`} onClick={onShow} data-testid="find-jobs-show" /> : null}
+        <Button title={running ? "Searching…" : done ? "Done for today" : "Find jobs for me"} icon={<Search className="h-4 w-4" />}
+          loading={busy} disabled={running || done || busy} onClick={start} data-testid="find-jobs-btn" />
+      </div>
+    </Card>
+  );
+}
+
+function FoundCard({ j }) {
+  const navigate = useNavigate();
+  return (
+    <Card className="flex flex-col gap-2" data-testid={`found-card-${j.job_id}`}>
+      <button onClick={() => navigate(`/job/${j.job_id}`)} className="text-left">
+        <p className="text-lg font-extrabold hover:text-brand">{j.title}</p>
+        <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-gray-500">
+          <span className="flex items-center gap-1"><Building2 className="h-3.5 w-3.5" />{j.company}</span>
+          <span className="flex items-center gap-1"><MapPin className="h-3.5 w-3.5" />{j.location || j.city || j.country}</span>
+          {j.work_mode ? <span>{j.work_mode}</span> : null}
+        </p>
+      </button>
+      <p className="text-sm text-gray-600">{j.preview}</p>
+      <p className="text-xs text-gray-400">Found for you on {formatDate(j.found_at)}</p>
+      <div className="mt-auto flex flex-wrap gap-2 pt-1">
+        <Button size="sm" title="View Details" onClick={() => navigate(`/job/${j.job_id}`)} />
+        {j.application_link ? <Button size="sm" variant="ghost" title="Apply" icon={<ExternalLink className="h-3.5 w-3.5" />} onClick={() => window.open(j.application_link, "_blank", "noopener")} /> : null}
+      </div>
+    </Card>
+  );
+}
+
+const TABS = [["found", "Found for you"], ["shared", "Job Alerts"], ["recommended", "Recommended Jobs"], ["strong", "Strong Matches"], ["recent", "Recently Added"],
   ["saved", "Saved Jobs"], ["viewed", "Previously Viewed"], ["check", "Check a Job Description"]];
 
 export default function Matches() {
@@ -151,18 +216,27 @@ export default function Matches() {
   const qc = useQueryClient();
   const [tab, setTab] = useState("recommended");
   const { data, isLoading, refetch } = useQuery({ queryKey: ["my-matches", user?.user_id], queryFn: () => api("/smartmatch/me"), enabled: user?.role === "candidate" });
+  const searchQ = useQuery({ queryKey: ["my-job-search", user?.user_id], queryFn: () => api("/me/job-search"), enabled: user?.role === "candidate",
+    refetchInterval: (q) => (q.state.data?.status === "running" ? 10000 : false) });
+  const search = searchQ.data;
+  const wasRunning = React.useRef(false);
+  useEffect(() => {  // a background search just finished: refresh alerts and show what it found
+    if (wasRunning.current && search && search.status !== "running") { refetch(); if (search.jobs.length) setTab("found"); }
+    wasRunning.current = search?.status === "running";
+  }, [search, refetch]);
   const refresh = () => { refetch(); qc.invalidateQueries({ queryKey: ["tracker"] }); };
-  const list = data?.[tab] || [];
+  const list = tab === "found" ? search?.jobs || [] : data?.[tab] || [];
   const markRead = (n) => !n.read_at && api(`/smartmatch/notifications/${n.notification_id}/read`, { method: "POST" }).then(refetch).catch(() => {});
   return (
     <Page>
       <PageHeader title="My Job Matches" subtitle="Jobs ranked by how well they fit your profile. JobRadar never applies on your behalf — contact the recruiter or use the company's own application link." />
       {!data && isLoading ? <Spinner /> : !data ? null : (
         <>
+          <FindJobs search={search} onChange={() => searchQ.refetch()} onShow={() => setTab("found")} />
           <div className="mb-6 grid gap-4 lg:grid-cols-[1fr_360px]">
             <div className="flex flex-wrap content-start gap-2" data-testid="matches-tabs">
-              {TABS.map(([k, l]) => (
-                <Chip key={k} label={k === "check" ? l : `${l} (${(data[k] || []).length})${k === "shared" && data.unread ? ` · ${data.unread} new` : ""}`} selected={tab === k} onClick={() => setTab(k)} data-testid={`matches-tab-${k}`} />
+              {TABS.filter(([k]) => k !== "found" || search?.enabled || search?.jobs?.length).map(([k, l]) => (
+                <Chip key={k} label={k === "check" ? l : `${l} (${(k === "found" ? search?.jobs : data[k] || []).length})${k === "shared" && data.unread ? ` · ${data.unread} new` : ""}`} selected={tab === k} onClick={() => setTab(k)} data-testid={`matches-tab-${k}`} />
               ))}
               <p className="w-full text-xs text-gray-500" data-testid="matches-alert-notice">
                 {data.alerts.pref === "opted_out" ? "You turned off job alerts, so JobRadar won't send you opportunities. Your matches below are still based on your profile. " : `${ALERT_NOTICE} `}
@@ -172,7 +246,7 @@ export default function Matches() {
             <ProfileCompletion compact />
           </div>
           {tab === "check" ? <JdCheck /> : list.length === 0 ? (
-            <EmptyState title="Nothing here yet" subtitle={tab === "shared" ? "When a new job strongly matches your profile, JobRadar alerts you here." : "Complete your profile to improve your matches."} data-testid="matches-empty" />
+            <EmptyState title="Nothing here yet" subtitle={tab === "found" ? "Use 'Find jobs for me' above and the jobs we find appear here." : tab === "shared" ? "When a new job strongly matches your profile, JobRadar alerts you here." : "Complete your profile to improve your matches."} data-testid="matches-empty" />
           ) : (
             <div className="grid gap-4 lg:grid-cols-2" data-testid={`matches-list-${tab}`}>
               {list.map((j) => (
@@ -180,7 +254,7 @@ export default function Matches() {
                   {j.notification ? (
                     <p className="mb-1.5 text-xs font-semibold text-brand">{j.notification.read_at ? "" : "New · "}Job alert from JobRadar on {formatDate(j.notification.sent_at)}</p>
                   ) : null}
-                  <MatchCard j={j} refresh={refresh} />
+                  {tab === "found" ? <FoundCard j={j} /> : <MatchCard j={j} refresh={refresh} />}
                 </div>
               ))}
             </div>

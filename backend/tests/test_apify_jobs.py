@@ -155,6 +155,19 @@ def test_linkedin_search_url_and_filters():
     assert linkedin_filters({}) == {}
 
 
+def test_personal_search_helpers():
+    from datetime import timedelta as td
+    from personal_search import ist_day, next_reset_utc, pair_key, pick_pair, years_of
+    late = datetime(2026, 11, 27, 18, 29, tzinfo=timezone.utc)  # 23:59 IST
+    assert ist_day(late) == "2026-11-27" and ist_day(late + td(minutes=1)) == "2026-11-28"
+    assert next_reset_utc(late) == datetime(2026, 11, 27, 18, 30, tzinfo=timezone.utc)
+    pairs = {pick_pair(["A", "B"], ["X", "Y"], f"2026-11-{d:02d}") for d in range(1, 5)}
+    assert pairs == {("A", "X"), ("A", "Y"), ("B", "X"), ("B", "Y")}, "rotates through every title × city"
+    assert pair_key("Data Analyst", "Pune", ["3", "4"]) == pair_key("data analyst", "PUNE", ["4", "3"])
+    assert pair_key("Data Analyst", "Pune", ["3", "4"]) != pair_key("Data Analyst", "Pune", ["4"])
+    assert (years_of("2-5 years"), years_of(4), years_of(None), years_of("fresher")) == (2.0, 4.0, None, None)
+
+
 # --------------------------------------------------------------------------- fake Apify API
 class Fake:
     items: list = []
@@ -219,6 +232,15 @@ class TestApifyFlow:
         cls.db.apify_runs.delete_many({"source_ids": {"$in": srcs}})
         cls.db.job_import_logs.delete_many({"title": {"$regex": "^TEST_APIFY"}})
         cls.db.users.delete_many({"email": {"$regex": "^test_apify_"}})
+        ps_users = [u["user_id"] for u in cls.db.users.find({"email": {"$regex": "^test_ps_"}}, {"user_id": 1})]
+        for coll in ("personal_quota", "personal_results", "user_sessions", "job_notifications", "subscriptions"):
+            key = "candidate_id" if coll in ("job_notifications", "subscriptions") else "user_id"
+            cls.db[coll].delete_many({key: {"$in": ps_users}})
+        cls.db.users.delete_many({"user_id": {"$in": ps_users}})
+        cls.db.personal_searches.delete_many({"title": {"$regex": "^TEST_PS"}})
+        cls.db.apify_runs.delete_many({"trigger": "personal"})
+        cls.db.job_sources.delete_many({"source_type": "Personal search", "keywords": {"$regex": "^TEST_PS"}})
+        cls.db.jobs.delete_many({"company": {"$regex": "^TEST_PS"}})
         cls.db.apify_runs.delete_many({"source_ids": "src_demand"})
         cls.db.job_sources.delete_many({"source_id": "src_demand"})
         cls.db.jobs.delete_many({"source_id": "src_demand"})
@@ -477,6 +499,128 @@ class TestApifyFlow:
         self.db.job_sources.delete_one({"source_id": src["source_id"]})
         self.db.jobs.delete_many({"source_id": src["source_id"]})
         self.db.apify_runs.delete_many({"source_ids": src["source_id"]})
+
+    # ------------------------------------------------------------------ candidate "Find jobs for me"
+    def candidate(self, name, title, city, years=3, paid=False):
+        from datetime import timedelta as td
+        uid = f"user_testps_{name}"
+        self.db.users.insert_one({"user_id": uid, "email": f"test_ps_{name}@example.com", "role": "candidate",
+                                  "full_name": f"PS {name}", "preferred_titles": [title], "preferred_locations": [city],
+                                  "total_experience": years, "suspended": False, "created_at": datetime.now(timezone.utc).isoformat()})
+        tok = f"tok_testps_{name}_{uuid.uuid4().hex[:6]}"
+        self.db.user_sessions.insert_one({"session_token": tok, "user_id": uid,
+                                          "expires_at": (datetime.now(timezone.utc) + td(days=1)).isoformat()})
+        if paid:
+            self.db.subscriptions.insert_one({"subscription_id": f"sub_testps_{name}", "candidate_id": uid, "status": "active",
+                                              "plan_id": "monthly", "plan_name": "Monthly",
+                                              "start_date": datetime.now(timezone.utc).isoformat(),
+                                              "expiry_date": (datetime.now(timezone.utc) + td(days=30)).isoformat(),
+                                              "created_at": datetime.now(timezone.utc).isoformat()})
+        return uid, {"Authorization": f"Bearer {tok}"}
+
+    def ps_items(self, base, n, title="TEST_PS Analyst"):
+        return [{**LINKEDIN_ITEM, "id": str(base + i), "title": f"{title} {i}", "companyName": f"TEST_PS Co {i}",
+                 "jobUrl": f"https://www.linkedin.com/jobs/view/{base + i}", "location": "Testabad, India"} for i in range(n)]
+
+    def finish(self, run_id, items):
+        Fake.items, Fake.events, Fake.status = items, len(items), "SUCCEEDED"
+        apify_run = self.db.apify_runs.find_one({"run_id": run_id})["apify_run_id"]
+        requests.post(f"{self.api}/apify/webhook", json={"resource": {"id": apify_run}}, headers={"X-JobRadar-Webhook": "hook-secret"})
+        for _ in range(40):
+            if self.db.apify_runs.find_one({"run_id": run_id}).get("processed"):
+                time.sleep(0.3)  # delivery runs right after the import
+                return
+            time.sleep(0.25)
+        raise AssertionError("run was not imported")
+
+    def test_personal_search(self):
+        from concurrent.futures import ThreadPoolExecutor
+        api = self.api
+        self.settings(personal_search_enabled=False)
+        a_id, a = self.candidate("a", "TEST_PS Analyst", "Testabad")
+        assert requests.post(f"{api}/me/job-search", headers=a).status_code == 503, "off by default"
+        self.settings(personal_search_enabled=True, personal_free_jobs=5, personal_paid_jobs=10, personal_daily_cap_usd=2,
+                      personal_db_threshold=10, personal_max_parallel=5, posted_within_days=7)
+        assert requests.get(f"{api}/me/job-search", headers=self.h).status_code == 403, "candidates only"
+
+        # Ten clicks at once start exactly one Apify run.
+        before = len(Fake.started)
+        with ThreadPoolExecutor(10) as ex:
+            codes = list(ex.map(lambda _: requests.post(f"{api}/me/job-search", headers=a).status_code, range(10)))
+        assert codes == [200] * 10, codes
+        assert len(Fake.started) == before + 1
+        inp = Fake.started[-1]["input"]
+        assert inp["titles"] == ["TEST_PS Analyst"] and inp["locations"] == ["Testabad"] and inp["rows"] == 10
+        assert inp["experienceLevels"] == ["3", "4"] and inp["publishedAt"] == "r604800"
+        assert "PS a" not in json.dumps(inp) and "example.com" not in json.dumps(inp)
+        st = requests.get(f"{api}/me/job-search", headers=a).json()
+        assert st["status"] == "running" and st["searching_for"]["title"] == "TEST_PS Analyst"
+        run_id = self.db.apify_runs.find({"trigger": "personal"}).sort("started_at", -1)[0]["run_id"]
+        assert self.db.job_sources.find_one({"source_id": self.db.apify_runs.find_one({"run_id": run_id})["source_ids"][0]})["hidden"]
+        srcs = requests.get(f"{api}/admin/sources", headers=self.h).json()["sources"]
+        assert not [x for x in srcs if x.get("source_type") == "Personal search"], "hidden from the admin list"
+
+        # A paid candidate wanting the same search joins it: no second Apify run.
+        b_id, b = self.candidate("b", "TEST_PS Analyst", "Testabad", years=4, paid=True)
+        assert requests.post(f"{api}/me/job-search", headers=b).json()["mode"] == "shared"
+        assert len(Fake.started) == before + 1
+
+        self.finish(run_id, self.ps_items(4600000100, 7))
+        st_a = requests.get(f"{api}/me/job-search", headers=a).json()
+        st_b = requests.get(f"{api}/me/job-search", headers=b).json()
+        assert (st_a["status"], st_a["delivered_today"], len(st_a["jobs"]), st_a["limit"]) == ("done", 5, 5, 5)
+        assert (st_b["status"], st_b["delivered_today"], len(st_b["jobs"]), st_b["limit"]) == ("done", 7, 7, 10)
+        assert self.db.job_notifications.count_documents({"candidate_id": a_id, "source": "personal_search"}) == 1
+        job = self.db.jobs.find_one({"job_id": st_a["jobs"][0]["job_id"]})
+        assert job["status"] == "Draft" and job["review_status"] == "new_import", "still goes to admin review"
+
+        # Done for today: another click starts nothing.
+        assert requests.post(f"{api}/me/job-search", headers=a).json()["mode"] == "already"
+        assert len(Fake.started) == before + 1
+
+        # A third candidate joining the finished search later gets it instantly, at no Apify cost.
+        c_id, c = self.candidate("c", "TEST_PS Analyst", "Testabad")
+        res = requests.post(f"{api}/me/job-search", headers=c).json()
+        assert res["mode"] == "shared" and res["status"] == "done" and res["delivered_today"] == 5
+        assert len(Fake.started) == before + 1
+
+        # Delivered jobs are visible to their candidate only, before an admin publishes them.
+        jid = st_a["jobs"][0]["job_id"]
+        assert requests.get(f"{api}/jobs/{jid}", headers=a).status_code == 200
+        d_id, d = self.candidate("d", "TEST_PS Painter", "Testabad")
+        assert requests.get(f"{api}/jobs/{jid}", headers=d).status_code == 404
+        assert requests.get(f"{api}/jobs/{jid}").status_code == 404
+
+        # An empty search gives the day back.
+        assert requests.post(f"{api}/me/job-search", headers=d).json()["mode"] == "started"
+        run_d = self.db.apify_runs.find({"trigger": "personal"}).sort("started_at", -1)[0]["run_id"]
+        self.finish(run_d, [])
+        assert requests.get(f"{api}/me/job-search", headers=d).json()["status"] == "free"
+
+        # A search stuck for over 10 minutes is released on the next click.
+        e_id, e = self.candidate("e", "TEST_PS Welder", "Testabad")
+        assert requests.post(f"{api}/me/job-search", headers=e).json()["mode"] == "started"
+        n = len(Fake.started)
+        old = (datetime.now(timezone.utc) - __import__("datetime").timedelta(minutes=11)).isoformat()
+        self.db.personal_quota.update_one({"user_id": e_id}, {"$set": {"started_at": old}})
+        self.db.personal_searches.update_one({"title": "TEST_PS Welder"}, {"$set": {"created_at": old}})
+        assert requests.post(f"{api}/me/job-search", headers=e).json()["mode"] == "started"
+        assert len(Fake.started) == n + 1
+
+        # The daily spending cap pauses live searches.
+        self.settings(personal_search_enabled=True, personal_daily_cap_usd=0)
+        f_id, f = self.candidate("f", "TEST_PS Baker", "Testabad")
+        r = requests.post(f"{api}/me/job-search", headers=f)
+        assert r.status_code == 429 and "paused" in r.json()["detail"]
+        assert requests.get(f"{api}/me/job-search", headers=f).json()["status"] == "free"
+
+        # No preferences: ask for a CV first.
+        g_id, g = self.candidate("g", "", "")
+        self.db.users.update_one({"user_id": g_id}, {"$set": {"preferred_titles": [], "preferred_locations": []}})
+        self.settings(personal_search_enabled=True)
+        assert requests.post(f"{api}/me/job-search", headers=g).status_code == 400
+        assert requests.get(f"{api}/admin/apify/overview", headers=self.h).json()["personal_today"]["runs"] >= 3
+        self.settings(personal_search_enabled=False)
 
     def test_cron_once_per_day(self):
         secret = os.environ.get("WEBHOOK_CRON_SECRET", "local-dev-cron-secret")

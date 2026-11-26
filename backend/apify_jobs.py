@@ -44,7 +44,12 @@ DEFAULT_SETTINGS = {
     "max_items_per_company": 25, "posted_within_days": 30, "monthly_budget_usd": 15.0, "per_run_cap_usd": 2.0,
     "paid_runs_approved": False, "auto_daily": True,
     "demand_search_enabled": False, "demand_max_pairs": 20, "demand_min_candidates": 2, "demand_jobs_per_pair": 10,
+    # Candidate "Find jobs for me": one live LinkedIn search a day per candidate, shared between candidates
+    # who want the same title, city and seniority that day.
+    "personal_search_enabled": False, "personal_free_jobs": 5, "personal_paid_jobs": 10, "personal_daily_cap_usd": 2.0,
+    "personal_db_threshold": 10, "personal_max_parallel": 5,
 }
+PERSONAL_TYPE = "Personal search"  # hidden, system-managed source rows (one per title × city × seniority)
 # A job search is a source with no URL: the LinkedIn Actor finds jobs matching its titles, locations and filters.
 SEARCH_TYPE = "Job search (LinkedIn)"
 # The candidate-demand search is a single system-managed source rebuilt daily from candidates' preferences.
@@ -329,6 +334,12 @@ class SettingsReq(BaseModel):
     demand_max_pairs: int = 20
     demand_min_candidates: int = 2
     demand_jobs_per_pair: int = 10
+    personal_search_enabled: bool = False
+    personal_free_jobs: int = 5
+    personal_paid_jobs: int = 10
+    personal_daily_cap_usd: float = 2.0
+    personal_db_threshold: int = 10
+    personal_max_parallel: int = 5
 
 
 class RunReq(BaseModel):
@@ -343,6 +354,7 @@ class ReviewReq(BaseModel):
 
 def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
     r = APIRouter()
+    after_finalize: List[Any] = []  # async hooks(run_doc, summary) called after a run is imported
     api_base = (os.environ.get("APIFY_API_BASE") or "https://api.apify.com").rstrip("/")
 
     def token() -> Optional[str]:
@@ -421,13 +433,20 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
             out.setdefault(key, []).append(x)
         return list(out.values())
 
-    async def start_runs(srcs: List[dict], trigger: str, admin: Optional[dict] = None) -> List[dict]:
+    async def start_runs(srcs: List[dict], trigger: str, admin: Optional[dict] = None, parallel: bool = False,
+                         cap_usd: Optional[float] = None) -> List[dict]:
+        """`parallel` runs (candidate personal searches) skip the one-collection-at-a-time rule but are limited to
+        `personal_max_parallel` unfinished runs; `cap_usd` lowers the per-run charge cap."""
         s = await settings()
         if not s["paid_runs_approved"]:
             raise HTTPException(409, "Apify runs need admin approval first: approve paid runs and set a monthly budget in Apify settings.")
         if not srcs:
             raise HTTPException(400, "No enabled, approved sources to collect from")
-        if await db.apify_runs.find_one({"processed": False, "started_at": {"$gte": (now() - timedelta(hours=6)).isoformat()}}):
+        recent = {"processed": False, "started_at": {"$gte": (now() - timedelta(hours=6)).isoformat()}}
+        if parallel:
+            if await db.apify_runs.count_documents({**recent, "trigger": trigger}) >= s["personal_max_parallel"]:
+                raise HTTPException(429, "Too many searches are running right now. Please try again in a few minutes.")
+        elif await db.apify_runs.find_one({**recent, "trigger": {"$ne": "personal"}}):
             raise HTTPException(409, "A collection run is still in progress. Check its status before starting another.")
         started = []
         for grp in groups(srcs, s):
@@ -435,7 +454,7 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
             remaining = round(s["monthly_budget_usd"] - spent, 4)
             if remaining <= 0.01:
                 raise HTTPException(409, f"This month's Apify budget (${s['monthly_budget_usd']}) is used up (${spent} spent).")
-            cap = round(min(s["per_run_cap_usd"], remaining), 2)
+            cap = round(min(s["per_run_cap_usd"], remaining, cap_usd if cap_usd is not None else remaining), 2)
             actor = source_actor(grp[0], s)
             kws = grp[0].get("keywords") or s["default_keywords"]
             locs = grp[0].get("locations") or s["default_locations"]
@@ -503,6 +522,11 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
             await db.job_sources.update_many({"source_id": {"$in": doc["source_ids"]}}, src_upd)
             if summary["created"] or summary["closed"]:
                 sm_helpers["invalidate_jobs"]()
+            for hook in after_finalize:
+                try:
+                    await hook({**doc, "status": status, "cost_usd": cost}, summary)
+                except Exception as e:  # noqa: BLE001 - the import itself succeeded; delivery is retried by its owner
+                    logger.warning(f"after-finalize hook failed for {run_id}: {e}")
             return {**doc, "status": status, "summary": summary, "cost_usd": cost}
         except Exception as e:  # noqa: BLE001 - released for the next attempt (webhook, cron or admin refresh)
             logger.warning(f"apify finalize {run_id} failed: {e}")
@@ -780,6 +804,14 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
             raise HTTPException(400, "Max jobs must be 1–1000")
         return d
 
+    async def personal_today() -> dict:
+        ist = timezone(timedelta(hours=5, minutes=30))
+        start = datetime.combine(now().astimezone(ist).date(), datetime.min.time(), tzinfo=ist).astimezone(timezone.utc)
+        agg = await db.apify_runs.aggregate([{"$match": {"trigger": "personal", "started_at": {"$gte": start.isoformat()}}},
+                                             {"$group": {"_id": None, "runs": {"$sum": 1},
+                                                         "usd": {"$sum": {"$ifNull": ["$cost_usd", "$cost_cap_usd"]}}}}]).to_list(1)
+        return {"runs": agg[0]["runs"], "spend_usd": round(agg[0]["usd"], 4)} if agg else {"runs": 0, "spend_usd": 0.0}
+
     @r.get("/admin/apify/overview")
     async def overview(admin=Depends(require_admin)):
         s = await settings()
@@ -801,6 +833,7 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
         return {"settings": s, "presets": ACTOR_PRESETS, "token_configured": bool(token()),
                 "webhook_configured": bool(os.environ.get("APIFY_WEBHOOK_SECRET") and os.environ.get("PUBLIC_BACKEND_URL")),
                 "month_spend_usd": await month_spend(), "apify_usage": apify_usage, "runs": runs,
+                "personal_today": await personal_today(),
                 "totals": {k: v for k, v in totals.items() if k != "_id"},
                 "options": {"source_types": SOURCE_TYPES, "permission": PERMISSION, "frequency": list(FREQUENCY),
                             "search_type": SEARCH_TYPE, "demand_type": DEMAND_TYPE,
@@ -815,6 +848,11 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
             raise HTTPException(400, "Max items per run must be 1–1000 and per company 1–200")
         if not 0 <= d["monthly_budget_usd"] <= 500 or not 0.1 <= d["per_run_cap_usd"] <= 50:
             raise HTTPException(400, "Budget must be $0–500 a month and per-run cap $0.10–50")
+        if not 1 <= d["personal_free_jobs"] <= 50 or not 1 <= d["personal_paid_jobs"] <= 50 \
+                or not 0 <= d["personal_daily_cap_usd"] <= 100 or not 1 <= d["personal_db_threshold"] <= 100 \
+                or not 1 <= d["personal_max_parallel"] <= 20:
+            raise HTTPException(400, "Personal search: 1–50 jobs a day, a $0–100 daily cap, a 1–100 match threshold "
+                                     "and 1–20 searches at once")
         if not 1 <= d["demand_max_pairs"] <= 100 or not 1 <= d["demand_min_candidates"] <= 50 \
                 or not 1 <= d["demand_jobs_per_pair"] <= 50:
             raise HTTPException(400, "Demand search: 1–100 searches, 1–50 candidates per search and 1–50 jobs per search")
@@ -871,7 +909,7 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
 
     @r.get("/admin/sources")
     async def list_sources(admin=Depends(require_admin)):
-        srcs = await db.job_sources.find({}, {"_id": 0}).sort("date_added", -1).to_list(500)
+        srcs = await db.job_sources.find({"hidden": {"$ne": True}}, {"_id": 0}).sort("date_added", -1).to_list(500)
         counts = {d["_id"]: d for d in await db.jobs.aggregate([{"$match": {"source_id": {"$ne": None}}}, {"$group": {
             "_id": "$source_id", "total": {"$sum": 1},
             "awaiting": {"$sum": {"$cond": [{"$in": ["$review_status", ["new_import", "pending_review"]]}, 1, 0]}},
@@ -1020,4 +1058,5 @@ def build_router(db, require_admin, audit_log, now_iso, bg, sm_helpers):
             await audit_log(admin, f"import_{req.action}", "job", ",".join(done)[:200], {"count": len(done)})
         return {"done": done, "skipped": skipped}
 
-    return r, {"daily_cycle": daily_cycle, "poll_pending": poll_pending}
+    return r, {"daily_cycle": daily_cycle, "poll_pending": poll_pending, "settings": settings, "start_runs": start_runs,
+               "token": token, "after_finalize": after_finalize}

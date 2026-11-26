@@ -99,6 +99,44 @@ function SourceModal({ src, options, onClose, onSaved }) {
   );
 }
 
+function PersonalCard({ ov, onSaved }) {
+  const [s, setS] = useState(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => setS({ ...ov.settings }), [ov.settings]);
+  if (!s) return null;
+  const set = (k) => (e) => setS((x) => ({ ...x, [k]: e?.target ? e.target.value : e }));
+  const save = async () => {
+    setBusy(true);
+    try {
+      await api("/admin/apify/settings", { method: "PUT", body: { ...s, personal_free_jobs: Number(s.personal_free_jobs), personal_paid_jobs: Number(s.personal_paid_jobs),
+        personal_daily_cap_usd: Number(s.personal_daily_cap_usd), personal_db_threshold: Number(s.personal_db_threshold), personal_max_parallel: Number(s.personal_max_parallel) } });
+      notify(s.personal_search_enabled ? "Candidate job search is on" : "Candidate job search is off", "success");
+      onSaved();
+    } catch (e) {
+      notify(errMsg(e), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const t = ov.personal_today || { runs: 0, spend_usd: 0 };
+  return (
+    <Card className="space-y-4" data-testid="personal-card">
+      <div><p className="h-sec">Candidate job search ("Find jobs for me")</p>
+        <p className="text-xs text-gray-500">Candidates get one live LinkedIn search a day for their own preferred title and city, only when they have fewer good matches than the threshold. Searches for the same title, city and seniority on the same day are shared. Today: {t.runs} search{t.runs === 1 ? "" : "es"}, {usd(t.spend_usd)} of {usd(s.personal_daily_cap_usd)}.</p></div>
+      <label className="flex items-center justify-between rounded-xl bg-brand-mist p-4 text-sm font-semibold">Let candidates search for jobs
+        <Switch checked={!!s.personal_search_enabled} onChange={set("personal_search_enabled")} data-testid="personal-enabled" /></label>
+      <div className="grid gap-3 md:grid-cols-5">
+        <Input label="Jobs a day (free)" inputMode="numeric" value={String(s.personal_free_jobs)} onChange={set("personal_free_jobs")} data-testid="personal-free" />
+        <Input label="Jobs a day (members)" inputMode="numeric" value={String(s.personal_paid_jobs)} onChange={set("personal_paid_jobs")} data-testid="personal-paid" />
+        <Input label="Daily cap (USD)" inputMode="decimal" value={String(s.personal_daily_cap_usd)} onChange={set("personal_daily_cap_usd")} data-testid="personal-cap" />
+        <Input label="Skip if matches ≥" inputMode="numeric" value={String(s.personal_db_threshold)} onChange={set("personal_db_threshold")} />
+        <Input label="Searches at once" inputMode="numeric" value={String(s.personal_max_parallel)} onChange={set("personal_max_parallel")} />
+      </div>
+      <Button title="Save candidate search" loading={busy} onClick={save} data-testid="personal-save" />
+    </Card>
+  );
+}
+
 function DemandCard({ ov, onSaved }) {
   const [s, setS] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -316,6 +354,7 @@ export function AdminJobSources() {
         )}
       </Card>
       <div className="mb-6"><DemandCard ov={d} onSaved={reload} /></div>
+      <div className="mb-6"><PersonalCard ov={d} onSaved={reload} /></div>
       <div className="grid gap-6 lg:grid-cols-2">
         <SettingsCard ov={d} onSaved={reload} />
         <Card className="space-y-3" data-testid="apify-runs">
