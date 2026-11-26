@@ -267,3 +267,46 @@ def test_export_truncates_cv_text_to_excel_cell_limit(app_ctx):
     import io
     rows = list(csv.DictReader(io.StringIO(client.get("/admin/talent/export", headers=H("a_full")).text)))
     assert len(rows[0]["cv_text"]) == CSV_CELL_MAX
+
+
+# ---------------------------------------------------------------- Excel export
+def test_build_xlsx_keeps_text_as_text():
+    import io as _io
+    from openpyxl import load_workbook
+    from xlsx_export import build_xlsx
+    data = build_xlsx([("a", "A"), ("b", "B"), ("c", "C"), ("d", "D")],
+                      [{"a": "=HYPERLINK(\"http://x\")", "b": ["x", "y"], "c": 7, "d": "bad\x07char"},
+                       {"a": None, "b": [{"degree": "MBA", "institution": "IIM", "year": "2016"}], "c": True, "d": "z" * 40000}],
+                      "Test")
+    ws = load_workbook(_io.BytesIO(data)).active
+    rows = list(ws.iter_rows(values_only=True))
+    assert rows[0] == ("A", "B", "C", "D")
+    assert rows[1] == ('=HYPERLINK("http://x")', "x; y", 7, "badchar")
+    assert ws["A2"].data_type == "s", "a value starting with = is stored as text, not a formula"
+    assert rows[2][1] == "MBA, IIM, 2016" and rows[2][2] == "Yes" and len(rows[2][3]) == 32000
+
+
+def test_candidates_excel_export(app_ctx):
+    import io as _io
+    from openpyxl import load_workbook
+    client, db, audits = app_ctx
+    assert client.post("/resume/paste", json={"text": CV}, headers=H("c1")).status_code == 200
+    assert client.get("/admin/export/candidates", headers=H("a_none")).status_code == 403
+    assert client.get("/admin/export/candidates", headers=H("c1")).status_code == 403
+    r = client.get("/admin/export/candidates", headers=H("a_full"))
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"].startswith("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    assert r.headers["content-disposition"].startswith('attachment; filename="candidates_')
+    ws = load_workbook(_io.BytesIO(r.content)).active
+    rows = list(ws.iter_rows(values_only=True))
+    head = rows[0]
+    assert head[:3] == ("Name", "Email", "Mobile") and head[-1] == "CV text" and "Membership" in head
+    rahul = dict(zip(head, next(x for x in rows[1:] if x[0] == "Rahul Verma")))
+    assert rahul["Email"] == "c1@example.com" and rahul["Account"] == "Active" and rahul["Membership"] == "no membership"
+    assert "Travel" in rahul["CV text"]
+    assert "export_candidates" in audits
+    assert client.get("/admin/export/candidates", params={"q": "nobody-matches"}, headers=H("a_full")).status_code == 200
+
+    t = client.get("/admin/talent/export", params={"format": "xlsx"}, headers=H("a_full"))
+    assert t.status_code == 200 and t.headers["content-disposition"].endswith('talent_database.xlsx"')
+    assert load_workbook(_io.BytesIO(t.content)).active["A1"].value

@@ -2179,7 +2179,8 @@ api.include_router(_build_demand_router(db, require_admin, compute_memberships, 
 from resumes import build_router as _build_resume_router  # noqa: E402
 
 _resume_router, _resume_helpers = _build_resume_router(db, get_current_user, require_admin, audit_log, now_iso, _bg,
-                                                       on_profile_change=_sm_helpers["candidate_changed"])
+                                                       on_profile_change=_sm_helpers["candidate_changed"],
+                                                       compute_memberships=compute_memberships)
 api.include_router(_resume_router)
 from apify_jobs import build_router as _build_apify_router, dedupe_key as _dedupe_key  # noqa: E402
 

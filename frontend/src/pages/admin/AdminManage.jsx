@@ -2,9 +2,9 @@ import React, { useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Search } from "lucide-react";
-import { api } from "@/lib/api";
+import { api, downloadFile } from "@/lib/api";
 import { CATEGORIES, CURRENCIES, EMPLOYMENT_TYPES, formatDate, INDUSTRIES, INDUSTRIES_WITH_OTHER, INDUSTRY_SHORT, JOB_SOURCES, JOB_STATUS_LABEL, JOB_STATUSES, money, NOTICE_PERIODS, REGIONS, VERIFICATION_STATUSES, WORK_MODES } from "@/lib/constants";
-import { Badge, Button, Card, Chip, ChipRow, Input, notify, PageHeader, Switch } from "@/components/kit";
+import { Badge, Button, Card, Chip, ChipRow, errMsg, Input, notify, PageHeader, Switch } from "@/components/kit";
 
 const SearchBox = ({ value, onChange, placeholder, testId }) => (
   <div className="flex items-center gap-2 rounded-xl border border-gray-200 bg-white px-4 focus-within:border-brand">
@@ -218,9 +218,17 @@ export function AdminCandidates() {
   const { data } = useQuery({ queryKey: ["admin-candidates", q, ind], queryFn: () => api("/admin/candidates", { query: { q, industry: ind } }) });
   const candidates = data?.candidates || [];
   const act = useAct(["admin-candidates"]);
+  const [exporting, setExporting] = useState(false);
+  const exportXlsx = () => {
+    setExporting(true);
+    downloadFile("/admin/export/candidates", { q, industry: ind }, `candidates_${new Date().toISOString().slice(0, 10)}.xlsx`)
+      .then(() => notify("Excel file downloaded", "success"))
+      .catch((e) => notify(errMsg(e), "error")).finally(() => setExporting(false));
+  };
   return (
     <>
-      <PageHeader title="Candidates" subtitle={`${candidates.length} candidates`} />
+      <PageHeader title="Candidates" subtitle={`${candidates.length} candidates`}
+        right={<Button variant="outline" title="Export to Excel" loading={exporting} onClick={exportXlsx} data-testid="candidates-export" />} />
       <div className="mb-6 space-y-3">
         <SearchBox value={q} onChange={setQ} placeholder="Search name, email, designation..." testId="admin-cand-search" />
         <div className="flex flex-wrap gap-2">

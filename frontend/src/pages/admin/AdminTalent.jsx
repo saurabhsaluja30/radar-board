@@ -120,12 +120,17 @@ export function AdminTalent() {
     queryFn: () => api("/admin/talent", { query: { ...applied, page, page_size: 25 } }) });
   const search = () => { setApplied(clean(f)); setPage(1); };
   const reset = () => { setF(EMPTY); setApplied({}); setPage(1); };
-  const exportCsv = () => downloadFile("/admin/talent/export", applied, "talent_database.csv").catch((e) => notify(errMsg(e), "error"));
+  const [exporting, setExporting] = useState(false);
+  const exportXlsx = () => {
+    setExporting(true);
+    downloadFile("/admin/talent/export", { ...applied, format: "xlsx" }, "talent_database.xlsx")
+      .catch((e) => notify(errMsg(e), "error")).finally(() => setExporting(false));
+  };
   const pages = data ? Math.max(1, Math.ceil(data.total / data.page_size)) : 1;
   return (
     <>
       <PageHeader title="Candidate Talent Database" subtitle={data ? `${data.total} matching · ${data.consented_total} candidates have opted in` : ""}
-        right={<Button variant="outline" title="Export CSV" onClick={exportCsv} data-testid="talent-export" />} />
+        right={<Button variant="outline" title="Export to Excel" loading={exporting} onClick={exportXlsx} data-testid="talent-export" />} />
       <Card className="mb-6 space-y-4" data-testid="talent-filters">
         <div className="grid gap-3 md:grid-cols-4">
           <Input className="md:col-span-2" label="Resume keyword" placeholder="e.g. Sabre, Python, Payroll" value={f.keyword} onChange={set("keyword")}

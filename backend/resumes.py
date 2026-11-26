@@ -33,6 +33,7 @@ from career import file_to_text
 from doctext import is_doc
 from resume_parse import extract, keywords
 from smartmatch import NOTICE_DAYS, norm_skill, profile_status
+from xlsx_export import build_xlsx, xlsx_response
 
 logger = logging.getLogger("jobradar.resumes")
 
@@ -190,7 +191,7 @@ def validate_file(name: str, data: bytes) -> str:
     raise HTTPException(400, "Please upload a PDF or Word (.doc or .docx) file.")
 
 
-def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on_profile_change=None):
+def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on_profile_change=None, compute_memberships=None):
     r = APIRouter()
     work_gate = asyncio.Semaphore(1)  # one parse at a time per replica (Starter: 0.25 vCPU burst)
 
@@ -595,7 +596,9 @@ def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on
 
     @r.get("/admin/talent/export")
     async def talent_export(request: Request, admin=Depends(require_perm("export_candidates"))):
-        f = await filters_with_settings(dict(request.query_params))
+        params = dict(request.query_params)
+        fmt = params.pop("format", "csv")
+        f = await filters_with_settings(params)
         rows = await db.users.find(talent_query(f), {**LIST_FIELDS, **{c: 1 for c in EXPORT_EXTRA}}
                                    ).sort("created_at", -1).to_list(5000)
         texts: Dict[str, str] = {}
@@ -606,6 +609,14 @@ def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on
                     {"_id": 0, "candidate_id": 1, "raw_text": 1}):
                 texts[rec["candidate_id"]] = (rec.get("raw_text") or "")[:CSV_CELL_MAX]
         cols = [c for c in LIST_FIELDS if c not in ("_id",)] + EXPORT_EXTRA + ["cv_text"]
+        if fmt == "xlsx":
+            for u in rows:
+                u["cv_text"] = texts.get(u["user_id"], "")
+            data = await asyncio.to_thread(build_xlsx, [(c, c.replace("_", " ").capitalize()) for c in cols], rows,
+                                           "Talent database")
+            await audit_log(admin, "export_talent_database", "candidate", "-", {"rows": len(rows), "format": "xlsx",
+                            "filters": {k: v for k, v in f.items() if not k.startswith("_")}})
+            return xlsx_response(data, "talent_database.xlsx")
         buf = io.StringIO()
         w = csv.writer(buf)
         w.writerow(cols)
@@ -616,6 +627,57 @@ def build_router(db, get_current_user, require_admin, audit_log, now_iso, bg, on
                         "filters": {k: v for k, v in f.items() if not k.startswith("_")}})
         return Response(content=buf.getvalue(), media_type="text/csv",
                         headers={"Content-Disposition": 'attachment; filename="talent_database.csv"', "Cache-Control": "no-store"})
+
+    CANDIDATE_COLUMNS = [
+        ("full_name", "Name"), ("email", "Email"), ("mobile", "Mobile"), ("created_at", "Joined"), ("account", "Account"),
+        ("membership_status", "Membership"), ("plan_name", "Plan"), ("membership_expiry", "Membership expiry"),
+        ("industry", "Industry"), ("current_designation", "Current designation"), ("current_company", "Current company"),
+        ("total_experience", "Total experience"), ("relevant_experience", "Relevant experience"),
+        ("current_location", "Current location"), ("current_salary", "Current salary"), ("expected_ctc", "Expected CTC"),
+        ("notice_period", "Notice period"), ("preferred_titles", "Preferred job titles"),
+        ("preferred_designation", "Preferred designation"), ("preferred_locations", "Preferred locations"),
+        ("preferred_location", "Preferred location"), ("preferred_work_mode", "Preferred work mode"),
+        ("preferred_industries", "Preferred industries"), ("primary_skills", "Skills"), ("tools", "Tools"),
+        ("certifications", "Certifications"), ("highest_qualification", "Highest qualification"),
+        ("institution", "Institution"), ("education", "Education"), ("languages", "Languages"), ("links", "Links"),
+        ("previous_companies", "Previous companies"), ("profile_completion", "Profile completion %"),
+        ("has_resume", "Has CV"), ("cv_text", "CV text")]
+
+    # Not under /admin/candidates/...: server.py's /admin/candidates/{candidate_id} is registered first and would match.
+    @r.get("/admin/export/candidates")
+    async def candidates_export(q: Optional[str] = None, industry: Optional[str] = None,
+                                admin=Depends(require_perm("export_candidates"))):
+        """Every candidate (same filters as the admin Candidates page) as an Excel file, with their CV text."""
+        query: dict = {"role": "candidate"}
+        conds = []
+        if industry and industry != "All":
+            conds.append({"$or": [{"industry": industry}, {"preferred_industries": industry}]})
+        if q:
+            rx_ = {"$regex": re.escape(q), "$options": "i"}
+            conds.append({"$or": [{"full_name": rx_}, {"email": rx_}, {"mobile": rx_}, {"current_designation": rx_},
+                                  {"preferred_designation": rx_}, {"industry": rx_}]})
+        if conds:
+            query["$and"] = conds
+        computed = {"account", "membership_status", "plan_name", "membership_expiry", "cv_text"}
+        fields = {"_id": 0, "user_id": 1, "suspended": 1, **{k: 1 for k, _ in CANDIDATE_COLUMNS if k not in computed}}
+        rows = await db.users.find(query, fields).sort("created_at", -1).to_list(20000)
+        ids = [u["user_id"] for u in rows]
+        texts: Dict[str, str] = {}
+        for i in range(0, len(ids), 500):
+            async for rec in db.candidate_resumes.find(
+                    {"candidate_id": {"$in": ids[i:i + 500]}, "is_current": True, "status": {"$ne": "deleted"}},
+                    {"_id": 0, "candidate_id": 1, "raw_text": 1}):
+                texts[rec["candidate_id"]] = rec.get("raw_text") or ""
+        ms = await compute_memberships(ids) if compute_memberships else {}
+        for u in rows:
+            m = ms.get(u["user_id"]) or {}
+            u.update(account="Suspended" if u.get("suspended") else "Active",
+                     membership_status=(m.get("status") or "no_membership").replace("_", " "), plan_name=m.get("plan_name"),
+                     membership_expiry=m.get("expiry_date"), cv_text=texts.get(u["user_id"], ""))
+        data = await asyncio.to_thread(build_xlsx, CANDIDATE_COLUMNS, rows, "Candidates")
+        await audit_log(admin, "export_candidates", "candidate", "-", {"rows": len(rows), "format": "xlsx",
+                                                                      "q": q, "industry": industry})
+        return xlsx_response(data, f"candidates_{datetime.now(timezone.utc).date().isoformat()}.xlsx")
 
     async def consented(cid: str) -> dict:
         u = await db.users.find_one({"user_id": cid, "role": "candidate", "talent_db_consent": True}, {"_id": 0, "password": 0})
